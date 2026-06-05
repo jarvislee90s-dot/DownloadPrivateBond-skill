@@ -61,7 +61,17 @@ def placeholder_xpath(placeholder, input_type=None):
 
 
 def build_prospectus_search_keyword(bond_full_name):
-    return f"{bond_full_name}募集说明书"
+    """构建募集说明书搜索关键词
+
+    去掉债券名称中的 (品种X) 后缀，提高搜索匹配率
+    例如：
+    "杭州高新技术产业开发区资产经营有限公司2026年面向专业投资者非公开发行公司债券(第一期)(品种一)"
+    → "杭州高新技术产业开发区资产经营有限公司2026年面向专业投资者非公开发行公司债券(第一期)募集说明书"
+    """
+    import re
+    # 去掉 (品种X) 后缀，但保留其他括号内容如 (第一期)
+    cleaned = re.sub(r'\(品种[一二三四五六七八九十]+\)', '', bond_full_name)
+    return f"{cleaned}募集说明书"
 
 
 def download_button_xpaths():
@@ -229,7 +239,24 @@ def title_matches_bond(title, bond_full_name):
 
 
 def is_target_prospectus_title(title, bond_full_name):
-    return "募集说明书" in str(title) and title_matches_bond(title, bond_full_name)
+    """判断是否为目标的募集说明书标题
+
+    匹配条件：
+    1. 标题包含"募集说明书"
+    2. 标题包含债券全称（去掉品种后缀后）
+    """
+    import re
+    if "募集说明书" not in str(title):
+        return False
+
+    # 去掉债券全称中的 (品种X) 后缀
+    cleaned_bond = re.sub(r'\(品种[一二三四五六七八九十]+\)', '', bond_full_name)
+
+    # 标准化后比较
+    normalized_title = normalize_for_match(title)
+    normalized_bond = normalize_for_match(cleaned_bond)
+
+    return normalized_bond in normalized_title
 
 
 def group_consecutive_issuers(rows):
@@ -364,8 +391,8 @@ def login(driver, username, password):
     print(f"[DEBUG] 已跳转至: {driver.current_url}")
     wait_visible(driver, By.XPATH, placeholder_xpath("标题、简称、发行人、债券代码"))
     print("[DEBUG] 公告信息页面加载完成")
-    driver.get(TENANT_ANNOUNCEMENTS_URL)
-    wait_visible(driver, By.XPATH, placeholder_xpath("标题、简称、发行人、债券代码"))
+    #driver.get(TENANT_ANNOUNCEMENTS_URL)
+    #wait_visible(driver, By.XPATH, placeholder_xpath("标题、简称、发行人、债券代码"))
 
     
 
@@ -525,9 +552,81 @@ def set_date_range(driver, start_input, end_input, year):
     wait_date_picker_closed(driver, timeout=3)
 
 
-def search_tenant_announcements(driver, bond_full_name, year):
+def wait_for_search_results(driver, bond_full_name, previous_first_title="", timeout=DEFAULT_WAIT_SECONDS):
+    """等待搜索结果加载完成
+
+    判断依据：
+    1. 表格行数 >= 1 且 < 20
+    2. 第一行标题与上一只债券不同（数据已刷新）
+    3. 第一行标题包含当前债券全称
+    4. 行数稳定（连续2次检测相同）
+    5. 或出现空数据提示
+    """
     _, _, _, By, _, _ = _import_selenium()
-    print(f"[DEBUG] 开始搜索债券: {bond_full_name}, 年份: {year}")
+    deadline = time.time() + timeout
+    last_row_count = 0
+    stable_count = 0
+
+    while time.time() < deadline:
+        # 检查可见行数（优先）
+        rows = visible_table_rows(driver)
+        current_count = len(rows)
+
+        # 如果有数据行，不再检查空数据提示（优先使用表格数据）
+        if current_count >= 1 and current_count < 20:
+            try:
+                title_cells = rows[0].find_elements(By.XPATH, "./td[1]")
+                if title_cells:
+                    first_title = title_cells[0].text.strip()
+                    normalized_title = normalize_for_match(first_title)
+
+                    # 如果不是第一只债券，先检查是否与上一只不同（数据已刷新）
+                    if previous_first_title:
+                        normalized_prev = normalize_for_match(previous_first_title)
+                        if normalized_title == normalized_prev:
+                            print(f"[DEBUG] 数据未刷新，仍是上一只债券的结果: {first_title[:50]}...")
+                            stable_count = 0
+                            last_row_count = current_count
+                            time.sleep(0.5)
+                            continue
+
+                    # 检查是否包含当前债券全称（使用募集说明书匹配逻辑）
+                    if is_target_prospectus_title(first_title, bond_full_name):
+                        if current_count == last_row_count:
+                            stable_count += 1
+                            if stable_count >= 2:
+                                print(f"[DEBUG] 搜索结果加载完成，共 {current_count} 行，第一行匹配")
+                                return rows
+                        else:
+                            stable_count = 0
+                            print(f"[DEBUG] 搜索结果变化中: {last_row_count} -> {current_count}")
+                    else:
+                        print(f"[DEBUG] 第一行不匹配当前债券: {first_title[:50]}...")
+            except Exception as e:
+                print(f"[DEBUG] 检查第一行时出错: {e}")
+
+        # 只有在没有数据行时，才检查空数据提示
+        elif current_count == 0 and has_empty_result_hint(driver):
+            print("[DEBUG] 检测到空数据提示")
+            return []
+
+        last_row_count = current_count
+        time.sleep(0.5)
+
+    # 超时返回当前可见行
+    final_rows = visible_table_rows(driver)
+    print(f"[DEBUG] 等待超时，返回当前 {len(final_rows)} 行")
+    return final_rows
+
+    # 超时返回当前可见行
+    final_rows = visible_table_rows(driver)
+    print(f"[DEBUG] 等待超时，返回当前 {len(final_rows)} 行")
+    return final_rows
+
+
+def search_tenant_announcements(driver, bond_full_name, year, is_first=False, previous_first_title=""):
+    _, _, _, By, _, _ = _import_selenium()
+    print(f"[DEBUG] 开始搜索债券: {bond_full_name}, 年份: {year}, 是否首个: {is_first}")
 
     print("[DEBUG] 定位开始日期输入框...")
     start_input = visible_input(driver, "开始日期")
@@ -545,10 +644,20 @@ def search_tenant_announcements(driver, bond_full_name, year):
         placeholder_xpath("标题、简称、发行人、债券代码"),
         keyword,
     )
+
     print("[DEBUG] 点击搜索按钮...")
     click_search_button_for_input(driver, search_input)
-    print("[DEBUG] 等待搜索结果...")
-    rows = wait_for_results_count_below(driver, 20, timeout=DEFAULT_WAIT_SECONDS)
+
+    # 第一个债券特殊处理：3秒后再次点击搜索（避免页面自动刷新全量公告）
+    if is_first:
+        print("[DEBUG] 首个债券，等待3秒后再次搜索...")
+        time.sleep(3)
+        print("[DEBUG] 再次点击搜索按钮...")
+        click_search_button_for_input(driver, search_input)
+
+    print("[DEBUG] 等待搜索结果加载...")
+    rows = wait_for_search_results(driver, bond_full_name, previous_first_title=previous_first_title, timeout=DEFAULT_WAIT_SECONDS)
+
     print(f"[DEBUG] 搜索结果行数: {len(rows)}")
     return rows
 
@@ -666,14 +775,25 @@ def close_download_dialog(driver):
         pass
 
 
-def find_and_download(driver, bond_full_name):
+def find_and_download(driver, bond_full_name, rows):
+    """在已搜索到的行中查找并下载募集说明书
+
+    Args:
+        driver: Selenium driver
+        bond_full_name: 债券全称
+        rows: 搜索返回的结果行（避免重新获取导致错位）
+    """
     _, _, _, By, _, _ = _import_selenium()
-    print(f"[DEBUG] 开始查找募集说明书: {bond_full_name}")
+    print(f"[DEBUG] 开始在 {len(rows)} 行中查找募集说明书: {bond_full_name}")
 
     for attempt in range(3):
         print(f"[DEBUG] 第 {attempt + 1} 次尝试查找...")
-        rows = visible_table_rows(driver)
-        print(f"[DEBUG] 当前可见行数: {len(rows)}")
+
+        # 使用传入的rows，不再重新获取
+        if attempt > 0:
+            # 重试时重新获取（可能页面有变化）
+            rows = visible_table_rows(driver)
+            print(f"[DEBUG] 重试，当前可见行数: {len(rows)}")
 
         for i, row in enumerate(rows):
             try:
@@ -690,6 +810,7 @@ def find_and_download(driver, bond_full_name):
                 print(f"[DEBUG] 处理第 {i+1} 行时出错: {e}")
                 continue
 
+        # 未找到匹配，尝试第一行
         if rows:
             try:
                 title_cells = rows[0].find_elements(By.XPATH, "./td[1]")
@@ -796,6 +917,8 @@ def process_rows(driver, rows):
 
     print(f"[DEBUG] 有效行数: {len(valid_rows)}")
 
+    previous_first_title = ""  # 记录上一只债券的第一行标题
+
     for idx, row in enumerate(valid_rows):
         company_name = row["company_name"]
         bond_full_name = row["bond_full_name"]
@@ -807,8 +930,19 @@ def process_rows(driver, rows):
             year = extract_year_from_bond_full_name(bond_full_name)
             print(f"[DEBUG] 提取年份: {year}")
 
-            search_tenant_announcements(driver, bond_full_name, year)
-            ok, message = find_and_download(driver, bond_full_name)
+            rows = search_tenant_announcements(driver, bond_full_name, year, is_first=(idx==0), previous_first_title=previous_first_title)
+            ok, message = find_and_download(driver, bond_full_name, rows)
+
+            # 记录本次的第一行标题，用于下一次比较
+            if rows:
+                try:
+                    from selenium.webdriver.common.by import By
+                    title_cells = rows[0].find_elements(By.XPATH, "./td[1]")
+                    if title_cells:
+                        previous_first_title = title_cells[0].text.strip()
+                        print(f"[DEBUG] 记录第一行标题供下次比较: {previous_first_title[:50]}...")
+                except Exception as e:
+                    print(f"[DEBUG] 记录第一行标题失败: {e}")
 
             if ok:
                 print(f"[DEBUG] 下载成功: {message}")
@@ -824,7 +958,18 @@ def process_rows(driver, rows):
             )
 
     print(f"\n[DEBUG] 全部处理完成，失败记录: {len(log_lines)}")
-    return log_lines
+    # 返回日志行和失败的债券记录（用于第二轮搜索）
+    failed_bonds = []
+    for line in log_lines:
+        parts = line.split('\t')
+        if len(parts) >= 3:
+            failed_bonds.append({
+                'company_name': parts[0],
+                'bond_short_name': parts[1],
+                'bond_full_name': parts[2],
+                'error': parts[3] if len(parts) > 3 else '未知错误'
+            })
+    return log_lines, failed_bonds
 
 
 def main():

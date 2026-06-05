@@ -1,85 +1,102 @@
 ---
 name: download-private-bond
-description: 私募债募集说明书下载工作流。用于根据名单截图提取公司名称和债券简称，生成 data/bond_list.json，套用内置 WIND 公式模板刷新债券字段，过滤公募债并排序，然后登录 Ratingdog 主体评级页面按发行人和债券全称下载“募集说明书”PDF。触发场景包括：处理 DownloadPrivateBond 项目、从 名单.png 生成私募债 Excel、刷新 WIND 私募债清单、下载 Ratingdog 相关公告附件、批量下载私募债募集说明书。
+description: 私募债募集说明书下载工作流。根据名单截图提取债券信息，生成 WIND Excel，登录 Ratingdog 按发行人和债券全称下载募集说明书 PDF。触发场景：处理 DownloadPrivateBond 项目、从名单.png 生成私募债清单、刷新 WIND 数据、下载 Ratingdog 公告附件。
 ---
 
 # 私募债募集说明书下载
 
-## 快速判断
-
-在 DownloadPrivateBond 项目内执行本 skill。遇到以下任务时使用：
-
-- 从名单截图识别“公司名称、债券简称”。
-- 用 `prepare_bond_excel.py` 生成并刷新 WIND Excel。
-- 用 `download_ratingdog_announcements.py` 登录 Ratingdog 下载募集说明书。
-- 排查日期筛选、私募勾选、附件下载、日志输出等问题。
-
-详细网页交互规则见 [workflow.md](references/workflow.md)。
-
-## 仓库约定
-
-- 固定资产位于 `skills\download-private-bond`。
-- 项目根部 `data`、`reference`、`output`、`Download` 是运行时目录。
-- `reference` 仅保留样例截图、样例 Excel、样例募集说明书。
-- 真实账号密码放在 `skills\download-private-bond\.env`，但该文件不提交；提交 `.env.example`。
-- 完整流程默认仅支持 Windows，因为 WIND 刷新依赖 Excel COM / `pywin32`。
-
-## 输入图片
-
-- 如果用户在触发 skill 时提供图片，优先使用该图片识别名单。
-- 如果没有提供图片，在项目 `reference` 目录查找文件名或修改日期包含今天日期的最新图片。
-- 如果仍没有找到图片，暂停并提醒用户提供名单截图。
-- 识别完成后，由 agent 写入 `data\bond_list.json`，不要把该动态文件放入 skill 目录。
-
 ## 工作流
 
-1. 准备截图识别结果。
-   - 将 agent/OCR 识别的记录写入 `data\bond_list.json`。
-   - JSON 每条记录包含 `company_name` 和 `bond_short_name`。
-   - `bond_list.json` 只是轻量输入；下载阶段需要 WIND 刷出的 Excel，不直接用它下载。
+### 1. 准备截图识别结果
 
-2. 生成 WIND Excel。
-   - 运行 `python skills\download-private-bond\scripts\prepare_bond_excel.py`。
-   - 脚本会复制 skill 内置的 `assets\公式模板.xlsx`，填入 A/B 列，刷新 C/D/E 列 WIND 公式，删除 `发行方式=公募` 的行，并按发行人名称升序排序。
-   - 输出在 `output\信评需求私募债_YYYYMMDD_HHMMSS.xlsx`。
+如果用户在触发 skill 时提供图片，优先使用该图片识别名单。
 
-3. 下载 Ratingdog 公告。
-   - 优先使用 `skills\download-private-bond\.env` 中的 `RATINGDOG_USERNAME` 和 `RATINGDOG_PASSWORD`。
-   - 也可用环境变量覆盖：
+- 识别完成后，将记录写入 `data\bond_list.json`
+- 格式：`[{ "company_name": "...", "bond_short_name": "..." }]`
+- `bond_list.json` 只是轻量输入；下载阶段需要 WIND 刷出的 Excel
+
+### 2. 生成 WIND Excel
 
 ```powershell
-$env:RATINGDOG_USERNAME="手机号"
-$env:RATINGDOG_PASSWORD="密码"
+python skills\download-private-bond\scripts\prepare_bond_excel.py
+```
+
+- 复制内置模板 `assets\公式模板.xlsx`
+- 填入公司名称和债券简称
+- 刷新 WIND 公式（需本地 Excel + WIND 插件）
+- 删除发行方式为"公募"的行，按发行人排序
+- 输出：`output\信评需求私募债_YYYYMMDD_HHMMSS.xlsx`
+
+**跳过 WIND 刷新（仅测试）：**
+```powershell
+python skills\download-private-bond\scripts\prepare_bond_excel.py --skip-wind
+```
+
+### 3. 下载 Ratingdog 公告
+
+```powershell
 python skills\download-private-bond\scripts\download_ratingdog_announcements.py
 ```
 
-   - 未传 `--excel` 时，脚本自动使用项目 `output` 目录下最新的 `信评需求私募债_*.xlsx`。
-   - 需要指定文件时再传：
+- 自动读取 `output` 目录下最新的 `信评需求私募债_*.xlsx`
+- 也可指定文件：`--excel "output\信评需求私募债_YYYYMMDD_HHMMSS.xlsx"`
 
+**环境变量（优先于 .env）：**
 ```powershell
-python skills\download-private-bond\scripts\download_ratingdog_announcements.py --excel "output\信评需求私募债_YYYYMMDD_HHMMSS.xlsx"
+$env:RATINGDOG_USERNAME="手机号"
+$env:RATINGDOG_PASSWORD="密码"
 ```
 
-4. 检查输出。
-   - PDF 默认下载到 `Download`。
-   - 日志默认写入 `output\download_log_YYYYMMDD_HHMMSS.txt`。
-   - 日志中记录未匹配、无附件、下载超时、债券全称无年份等情况。
+**输出位置：**
+- PDF 下载到 `Download\`
+- 日志写入 `output\download_log_YYYYMMDD_HHMMSS.txt`
+- 日志格式：制表符分隔的公司名、债券简称、债券全称、错误原因
+
+### 4. 第二轮搜索（可选）
+
+当第一轮存在失败债券时，进行第二轮搜索：
+
+**情况A：浏览器未关闭（复用会话）**
+```powershell
+# 直接在现有浏览器中继续搜索失败债券
+python skills\download-private-bond\scripts\download_ratingdog_announcements.py
+```
+
+**情况B：浏览器已关闭（创建重试Excel）**
+
+1. **复制原Excel**：
+   ```powershell
+   Copy-Item "output\信评需求私募债_YYYYMMDD_HHMMSS.xlsx" "output\信评需求私募债_重试.xlsx"
+   ```
+
+2. **手动编辑重试Excel**：
+   - 打开 `output\信评需求私募债_重试.xlsx`
+   - **删除已成功下载的行**（保留失败的债券）
+   - **删除债券简称含"PPN"的行**（公开渠道无法获取募集说明书）
+   - 保存文件
+
+3. **运行重试**：
+   ```powershell
+   python skills\download-private-bond\scripts\download_ratingdog_announcements.py --excel "output\信评需求私募债_重试.xlsx"
+   ```
+
+**筛选规则：**
+- 从第一轮日志中查看失败记录
+- **排除债券简称包含"PPN"的债券**（定向债务融资工具无法下载）
+- 仅保留非PPN的失败债券进入第二轮
 
 ## 关键约束
 
-- 下载目标必须是标题中同时匹配债券全称且包含“募集说明书”的公告附件。
-- 先按债券全称中的年份筛 `YYYY-01-01` 到 `YYYY-12-31`，再勾选“只看私募”，然后搜索。
-- 如果年度私募范围内没有匹配，再撤销日期和私募筛选，在全部公告里搜索一次。
-- 相邻两行发行人相同，保持同一个发行人详情页，逐只债券搜索；发行人变化后关闭详情标签并回到“主体评级”。
-- 不读取或展示 `.env`、密钥、凭据文件内容。
+- **仅支持 Windows**：WIND 刷新依赖 `pywin32` 和本地 Excel
+- **下载目标**：标题必须同时匹配债券全称且包含"募集说明书"
+- **日期筛选**：按债券全称中的年份设置 `YYYY-01-01` 至 `YYYY-12-31`
+- **搜索关键词**：债券全称 + "募集说明书"（自动去掉 `(品种X)` 后缀）
+- **账号安全**：`.env` 已被 `.gitignore` 排除，不要提交真实账号
 
-## 验证
+## 依赖检查
 
-修改脚本后至少运行：
-
-```powershell
-python -m unittest discover -s tests -p "test_*.py" -v
-python -m py_compile skills\download-private-bond\scripts\prepare_bond_excel.py skills\download-private-bond\scripts\download_ratingdog_announcements.py
-```
-
-真实联调时，先用单行 Excel 烟测，确认下载到的是“募集说明书”PDF，再运行全量任务。
+运行前确认已安装：
+- Python 3.10+
+- `openpyxl`、`selenium`、`pywin32` (Windows)
+- Microsoft Excel + WIND 金融终端插件
+- Google Chrome + 匹配版本的 ChromeDriver
