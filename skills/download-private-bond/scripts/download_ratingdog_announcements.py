@@ -23,6 +23,9 @@ ROOT = find_project_root(SCRIPT_DIR)
 DEFAULT_DOWNLOAD_DIR = ROOT / "Download"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 DEFAULT_EXCEL_PATTERN = "信评需求私募债_*.xlsx"
+DEFAULT_WAIT_SECONDS = 30
+INTERACTION_PAUSE_SECONDS = 0.5
+TENANT_ANNOUNCEMENTS_URL = "https://www.ratingdog.cn/information/announcementsForTenant"
 
 
 def load_skill_env(env_path=SKILL_DIR / ".env"):
@@ -48,6 +51,152 @@ def _import_selenium():
     from selenium.webdriver.support.ui import WebDriverWait
 
     return webdriver, TimeoutException, Options, By, EC, WebDriverWait
+
+
+def placeholder_xpath(placeholder, input_type=None):
+    xpath = f"//input[@placeholder='{placeholder}'"
+    if input_type:
+        xpath += f" and @type='{input_type}'"
+    return xpath + "]"
+
+
+def build_prospectus_search_keyword(bond_full_name):
+    return f"{bond_full_name}募集说明书"
+
+
+def download_button_xpaths():
+    # 先定位附件列(class包含column_12) → 找file-desc → 找包含"下载"文本的span
+    return [
+        ".//td[contains(@class,'column_12')]//span[@class='file-desc']/span[contains(text(),'下载')]",
+        ".//td[contains(@class,'column_12')]//span[@class='file-desc']//span[contains(text(),'下载')]",
+        ".//td[contains(@class,'column_12')]//span[contains(text(),'下载')]",
+        ".//td[last()]//span[@class='file-desc']//span[contains(text(),'下载')]",
+    ]
+
+
+def search_button_xpaths():
+    return [
+        "./ancestor::*[contains(@class,'yyep-input-group')][1]//div[contains(@class,'yyep-input-group__append')]//button",
+        "./ancestor::form[1]//div[contains(@class,'yyep-input-group__append')]//button",
+        "./ancestor::form[1]//button[.//svg or contains(@class,'yyep-button')]",
+    ]
+
+
+def pause_between_interactions():
+    time.sleep(INTERACTION_PAUSE_SECONDS)
+
+
+def wait_visible(driver, by, locator, timeout=DEFAULT_WAIT_SECONDS):
+    _, _, _, _, EC, WebDriverWait = _import_selenium()
+    return WebDriverWait(driver, timeout).until(
+        EC.visibility_of_element_located((by, locator))
+    )
+
+
+def wait_clickable(driver, by, locator, timeout=DEFAULT_WAIT_SECONDS):
+    _, _, _, _, EC, WebDriverWait = _import_selenium()
+    return WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((by, locator))
+    )
+
+
+def click_when_ready(driver, by, locator, timeout=DEFAULT_WAIT_SECONDS):
+    element = wait_clickable(driver, by, locator, timeout=timeout)
+    driver.execute_script("arguments[0].click();", element)
+    pause_between_interactions()
+    return element
+
+
+def input_when_ready(driver, by, locator, value, timeout=DEFAULT_WAIT_SECONDS):
+    element = wait_visible(driver, by, locator, timeout=timeout)
+    element.clear()
+    if value:
+        element.send_keys(value)
+    pause_between_interactions()
+    return element
+
+
+def input_first_visible_when_ready(driver, locators, value, timeout=DEFAULT_WAIT_SECONDS):
+    _, _, _, _, _, WebDriverWait = _import_selenium()
+    element = WebDriverWait(driver, timeout).until(
+        lambda _: first_visible_locator(driver, locators)
+    )
+    element.clear()
+    if value:
+        element.send_keys(value)
+    pause_between_interactions()
+    return element
+
+
+def first_visible_locator(driver, locators):
+    for by, locator in locators:
+        try:
+            element = first_displayed(driver.find_elements(by, locator))
+            if element is not None:
+                return element
+        except Exception:
+            continue
+    return False
+
+
+def first_displayed(elements):
+    for element in elements:
+        try:
+            if element.is_displayed():
+                return element
+        except Exception:
+            continue
+    return None
+
+
+def wait_child_visible(driver, parent, by, locator, timeout=DEFAULT_WAIT_SECONDS):
+    _, _, _, _, _, WebDriverWait = _import_selenium()
+    return WebDriverWait(driver, timeout).until(
+        lambda _: safe_first_displayed(parent, by, locator)
+    )
+
+
+def click_child_when_ready(driver, parent, by, locator, timeout=DEFAULT_WAIT_SECONDS):
+    element = wait_child_visible(driver, parent, by, locator, timeout=timeout)
+    driver.execute_script("arguments[0].click();", element)
+    pause_between_interactions()
+    return element
+
+
+def wait_existing_ready(driver, element, timeout=DEFAULT_WAIT_SECONDS):
+    _, _, _, _, _, WebDriverWait = _import_selenium()
+    WebDriverWait(driver, timeout).until(
+        lambda _: element_is_ready(element)
+    )
+    return element
+
+
+def click_element_when_ready(driver, element, timeout=DEFAULT_WAIT_SECONDS):
+    wait_existing_ready(driver, element, timeout=timeout)
+    driver.execute_script("arguments[0].click();", element)
+    pause_between_interactions()
+    return element
+
+
+def send_keys_when_ready(driver, element, *keys, timeout=DEFAULT_WAIT_SECONDS):
+    wait_existing_ready(driver, element, timeout=timeout)
+    element.send_keys(*keys)
+    pause_between_interactions()
+    return element
+
+
+def safe_first_displayed(parent, by, locator):
+    try:
+        return first_displayed(parent.find_elements(by, locator))
+    except Exception:
+        return False
+
+
+def element_is_ready(element):
+    try:
+        return element.is_displayed() and element.is_enabled()
+    except Exception:
+        return False
 
 
 def extract_year_from_bond_full_name(value):
@@ -162,98 +311,89 @@ def create_driver(download_dir):
 
 
 def find_visible(driver, by, locator, timeout=20):
-    _, TimeoutException, _, _, _, WebDriverWait = _import_selenium()
-    deadline = time.time() + timeout
-    last_error = None
-    while time.time() < deadline:
-        try:
-            elements = driver.find_elements(by, locator)
-            for element in elements:
-                if element.is_displayed():
-                    return element
-        except Exception as exc:
-            last_error = exc
-        time.sleep(0.2)
-    raise TimeoutException(f"未找到可见元素：{locator}") from last_error
+    return wait_visible(driver, by, locator, timeout=timeout)
 
 
 def visible_input(driver, placeholder, timeout=20):
     _, _, _, By, _, _ = _import_selenium()
-    return find_visible(driver, By.XPATH, f"//input[@placeholder='{placeholder}']", timeout=timeout)
+    return wait_visible(driver, By.XPATH, placeholder_xpath(placeholder), timeout=timeout)
 
 
 def click_if_visible(driver, xpath, timeout=3):
     _, TimeoutException, _, By, _, _ = _import_selenium()
     try:
-        element = find_visible(driver, By.XPATH, xpath, timeout=timeout)
-        driver.execute_script("arguments[0].click();", element)
+        click_when_ready(driver, By.XPATH, xpath, timeout=timeout)
         return True
     except TimeoutException:
         return False
 
 
 def login(driver, username, password):
-    _, _, _, By, EC, WebDriverWait = _import_selenium()
-    wait = WebDriverWait(driver, 30)
-    for attempt in range(2):
-        driver.get("https://www.ratingdog.cn/login")
-        click_if_visible(driver, "//*[text()='手机密码登录']", timeout=5)
-        phone_input, password_input = visible_login_inputs(driver, timeout=60)
-        phone_input.clear()
-        password_input.clear()
-        phone_input.send_keys(username)
-        password_input.send_keys(password)
-        login_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='登录']]")))
-        driver.execute_script("arguments[0].click();", login_button)
-        wait_for_login_submit(driver)
-        driver.get("https://www.ratingdog.cn/researchIssuer/yyRating")
-        try:
-            visible_input(driver, "代码、简称、发行人", timeout=30)
-            return
-        except Exception:
-            if attempt == 1:
-                raise
-            time.sleep(2)
+    _, _, _, By, _, _ = _import_selenium()
+
+    print("[DEBUG] 正在打开登录页面...")
+    driver.get("https://www.ratingdog.cn/login")
+    print(f"[DEBUG] 当前URL: {driver.current_url}")
+
+    print("[DEBUG] 切换到密码登录标签...")
+    click_when_ready(driver, By.ID, "tab-1")
+    print("[DEBUG] 输入用户名...")
+    input_first_visible_when_ready(
+        driver,
+        [
+            (By.CSS_SELECTOR, "#pane-2 input[placeholder='请输入']"),
+            (By.XPATH, placeholder_xpath("请输入手机号码")),
+        ],
+        username,
+    )
+    print("[DEBUG] 输入密码...")
+    input_first_visible_when_ready(
+        driver,
+        [
+            (By.CSS_SELECTOR, "#pane-2 input[placeholder='请输入密码']"),
+            (By.XPATH, placeholder_xpath("请输入密码", input_type="password")),
+        ],
+        password,
+    )
+    print("[DEBUG] 点击登录按钮...")
+    click_when_ready(driver, By.CSS_SELECTOR, "button.yyep-button--primary")
+    print("[DEBUG] 等待登录成功...")
+    wait_visible(driver, By.XPATH, "//span[@class='txtColor' and text()='公告信息']")
+    print("[DEBUG] 登录成功，正在跳转公告信息页面...")
+    driver.get(TENANT_ANNOUNCEMENTS_URL)
+    print(f"[DEBUG] 已跳转至: {driver.current_url}")
+    wait_visible(driver, By.XPATH, placeholder_xpath("标题、简称、发行人、债券代码"))
+    print("[DEBUG] 公告信息页面加载完成")
+    driver.get(TENANT_ANNOUNCEMENTS_URL)
+    wait_visible(driver, By.XPATH, placeholder_xpath("标题、简称、发行人、债券代码"))
+
+    
 
 
-def visible_login_inputs(driver, timeout=60):
-    _, TimeoutException, _, By, _, _ = _import_selenium()
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        inputs = [
-            element for element in driver.find_elements(By.TAG_NAME, "input")
-            if element.is_displayed()
-        ]
-        phone_inputs = [
-            element for element in inputs
-            if (element.get_attribute("type") or "").lower() in ("text", "tel")
-        ]
-        password_inputs = [
-            element for element in inputs
-            if (element.get_attribute("type") or "").lower() == "password"
-        ]
-        if phone_inputs and password_inputs:
-            return phone_inputs[0], password_inputs[0]
-        time.sleep(0.2)
-    raise TimeoutException("未找到登录页手机号和密码输入框")
 
 
-def wait_for_login_submit(driver, timeout=60):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if "login" not in driver.current_url:
-            return
-        logged_in = driver.execute_script(
-            """
-            const keys = Object.keys(window.localStorage || {});
-            return keys.some(key => /token|auth/i.test(key) && localStorage.getItem(key));
-            """
+
+def safe_attribute(element, name):
+    try:
+        return element.get_attribute(name) or ""
+    except Exception:
+        return ""
+
+
+def login_state_ready(driver):
+    if "login" not in driver.current_url:
+        return True
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                const keys = Object.keys(window.localStorage || {});
+                return keys.some(key => /token|auth/i.test(key) && localStorage.getItem(key));
+                """
+            )
         )
-        if logged_in:
-            time.sleep(2)
-            return
-        time.sleep(0.5)
-    return
+    except Exception:
+        return False
 
 
 def _has_login_state(driver):
@@ -272,91 +412,57 @@ def _has_login_state(driver):
         return False
 
 
-def search_issuer(driver, company_name):
-    _, _, _, By, EC, WebDriverWait = _import_selenium()
-    wait = WebDriverWait(driver, 30)
-    search_input = visible_input(driver, "代码、简称、发行人")
-    search_input.clear()
-    search_input.send_keys(company_name)
-    search_button = search_input.find_element(
-        By.XPATH,
-        "./ancestor::form[1]//button[contains(@class,'yyep-button--default')]",
-    )
-    driver.execute_script("arguments[0].click();", search_button)
-    first_link = wait.until(EC.element_to_be_clickable((By.XPATH, "//tbody/tr[1]/td[1]//a[contains(@class,'details')]")))
-    driver.execute_script("arguments[0].click();", first_link)
-    wait.until(EC.presence_of_element_located((By.XPATH, "//*[@role='tab' and .//span[text()='相关公告']]")))
-
-
-def open_announcements_tab(driver):
-    _, TimeoutException, _, By, _, _ = _import_selenium()
-    deadline = time.time() + 30
-    last_error = None
-
-    while time.time() < deadline:
-        try:
-            tab = find_visible(
-                driver,
-                By.XPATH,
-                "//*[@role='tab' and .//span[text()='相关公告']]",
-                timeout=2,
-            )
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", tab)
-            try:
-                tab.click()
-            except Exception:
-                driver.execute_script("arguments[0].click();", tab)
-
-            visible_input(driver, "标题", timeout=2)
-            return
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.3)
-
-    raise TimeoutException("点击相关公告后未出现标题筛选框") from last_error
-
-
-def set_private_checkbox(driver, checked):
-    _, TimeoutException, _, By, _, _ = _import_selenium()
-    try:
-        label = find_visible(
-            driver,
-            By.XPATH,
-            "//label[contains(@class,'yyep-checkbox') and .//*[contains(text(),'只看私募')]]",
-            timeout=10,
-        )
-    except TimeoutException:
-        label = driver.execute_script(
-            """
-            return [...document.querySelectorAll('label.yyep-checkbox')]
-              .find(el => el.innerText && el.innerText.includes('只看私募')) || null;
-            """
-        )
-        if label is None:
-            raise
-    checkbox = label.find_element(By.XPATH, ".//input[@type='checkbox']")
-    if checkbox.is_selected() != checked:
-        driver.execute_script("arguments[0].click();", label)
-        time.sleep(1)
-
-
-def clear_and_type(element, value):
-    element.clear()
-    if value:
-        element.send_keys(value)
-
-
 def dismiss_date_picker(driver, fallback_element=None):
     from selenium.webdriver.common.keys import Keys
 
+    _, _, _, By, _, _ = _import_selenium()
     active_element = driver.switch_to.active_element
-    active_element.send_keys(Keys.ESCAPE)
-    time.sleep(0.3)
-    if fallback_element is not None:
-        driver.execute_script("arguments[0].click();", fallback_element)
-    else:
-        driver.execute_script("document.body.click();")
-    time.sleep(0.5)
+    send_keys_when_ready(driver, active_element, Keys.ENTER)
+    if wait_date_picker_closed(driver, timeout=3):
+        return
+
+    if click_date_picker_confirm(driver):
+        wait_date_picker_closed(driver)
+        return
+
+    send_keys_when_ready(driver, active_element, Keys.ESCAPE)
+    if wait_date_picker_closed(driver, timeout=3):
+        return
+
+    click_when_ready(driver, By.TAG_NAME, "body")
+    wait_date_picker_closed(driver, timeout=3)
+
+
+def click_date_picker_confirm(driver):
+    _, TimeoutException, _, By, _, _ = _import_selenium()
+    confirm_xpaths = [
+        "//div[contains(@class,'yyep-picker-panel') and not(contains(@style,'display: none'))]//button[normalize-space()='确定']",
+        "//div[contains(@class,'yyep-picker-panel') and not(contains(@style,'display: none'))]//button[normalize-space()='确认']",
+        "//div[contains(@class,'yyep-picker-panel') and not(contains(@style,'display: none'))]//button[contains(@class,'yyep-picker-panel__link-btn') and not(@disabled)]",
+    ]
+    for xpath in confirm_xpaths:
+        try:
+            click_when_ready(driver, By.XPATH, xpath, timeout=3)
+            return True
+        except TimeoutException:
+            continue
+    return False
+
+
+def wait_date_picker_closed(driver, timeout=DEFAULT_WAIT_SECONDS):
+    _, TimeoutException, _, _, _, WebDriverWait = _import_selenium()
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda current_driver: not current_driver.execute_script(
+                """
+                return [...document.querySelectorAll('.yyep-picker-panel')]
+                  .some(el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+                """
+            )
+        )
+        return True
+    except TimeoutException:
+        return False
 
 
 def set_date_range(driver, start_input, end_input, year):
@@ -366,11 +472,11 @@ def set_date_range(driver, start_input, end_input, year):
     end_value = f"{year}-12-31" if year else ""
 
     def set_input_value(element, value):
-        element.click()
-        element.send_keys(Keys.CONTROL, "a")
-        element.send_keys(Keys.BACKSPACE)
+        click_element_when_ready(driver, element)
+        send_keys_when_ready(driver, element, Keys.CONTROL, "a")
+        send_keys_when_ready(driver, element, Keys.BACKSPACE)
         if value:
-            element.send_keys(value)
+            send_keys_when_ready(driver, element, value)
         driver.execute_script(
             """
             const el = arguments[0];
@@ -390,7 +496,6 @@ def set_date_range(driver, start_input, end_input, year):
 
     set_input_value(start_input, start_value)
     set_input_value(end_input, end_value)
-    end_input.send_keys(Keys.ENTER)
     dismiss_date_picker(driver, fallback_element=start_input)
 
     actual_start = start_input.get_attribute("value") or ""
@@ -417,20 +522,114 @@ def set_date_range(driver, start_input, end_input, year):
             end_input,
             end_value,
         )
-    dismiss_date_picker(driver, fallback_element=start_input)
+    wait_date_picker_closed(driver, timeout=3)
 
 
-def search_announcements(driver, year=None, private_only=True):
+def search_tenant_announcements(driver, bond_full_name, year):
     _, _, _, By, _, _ = _import_selenium()
-    title_input = visible_input(driver, "标题")
-    clear_and_type(title_input, "")
+    print(f"[DEBUG] 开始搜索债券: {bond_full_name}, 年份: {year}")
+
+    print("[DEBUG] 定位开始日期输入框...")
     start_input = visible_input(driver, "开始日期")
+    print("[DEBUG] 定位结束日期输入框...")
     end_input = visible_input(driver, "结束日期")
+    print(f"[DEBUG] 设置日期范围: {year}-01-01 至 {year}-12-31")
     set_date_range(driver, start_input, end_input, year)
-    set_private_checkbox(driver, private_only)
-    search_button = title_input.find_element(By.XPATH, "./ancestor::form[1]//button[contains(@class,'yyep-button--default')]")
-    driver.execute_script("arguments[0].click();", search_button)
-    wait_for_announcement_results(driver)
+    print("[DEBUG] 日期范围设置完成")
+
+    keyword = build_prospectus_search_keyword(bond_full_name)
+    print(f"[DEBUG] 搜索关键词: {keyword}")
+    search_input = input_when_ready(
+        driver,
+        By.XPATH,
+        placeholder_xpath("标题、简称、发行人、债券代码"),
+        keyword,
+    )
+    print("[DEBUG] 点击搜索按钮...")
+    click_search_button_for_input(driver, search_input)
+    print("[DEBUG] 等待搜索结果...")
+    rows = wait_for_results_count_below(driver, 20, timeout=DEFAULT_WAIT_SECONDS)
+    print(f"[DEBUG] 搜索结果行数: {len(rows)}")
+    return rows
+
+
+def click_search_button_for_input(driver, search_input):
+    _, _, _, By, _, _ = _import_selenium()
+    for xpath in search_button_xpaths():
+        try:
+            click_child_when_ready(driver, search_input, By.XPATH, xpath, timeout=5)
+            return
+        except Exception:
+            continue
+    raise RuntimeError("未找到搜索按钮")
+
+
+def wait_for_results_count_below(driver, limit, timeout=DEFAULT_WAIT_SECONDS):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        total_count = read_pagination_total_count(driver)
+        if total_count is not None and total_count < limit:
+            return visible_table_rows(driver)
+        if has_empty_result_hint(driver):
+            return []
+        time.sleep(0.5)
+    return visible_table_rows(driver)
+
+
+def read_pagination_total_count(driver):
+    _, _, _, By, _, _ = _import_selenium()
+    totals = driver.find_elements(By.CSS_SELECTOR, "span.yyep-pagination__total")
+    for total in totals:
+        try:
+            if not total.is_displayed():
+                continue
+            match = re.search(r"共\s*(\d+)\s*条", total.text)
+            if match:
+                return int(match.group(1))
+        except Exception:
+            continue
+    return None
+
+
+def visible_table_rows(driver):
+    _, _, _, By, _, _ = _import_selenium()
+    rows = []
+    for row in driver.find_elements(By.XPATH, "//tbody/tr"):
+        try:
+            if row.is_displayed():
+                rows.append(row)
+        except Exception:
+            continue
+    return rows
+
+
+def has_empty_result_hint(driver):
+    _, _, _, By, _, _ = _import_selenium()
+    empty_hints = driver.find_elements(By.XPATH, "//*[contains(text(),'暂无数据') or contains(text(),'无数据')]")
+    for element in empty_hints:
+        try:
+            if element.is_displayed():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_for_matching_announcement_or_empty(driver, bond_full_name, timeout=DEFAULT_WAIT_SECONDS):
+    _, TimeoutException, _, _, _, _ = _import_selenium()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for row in visible_table_rows(driver):
+            try:
+                title_cells = row.find_elements(By.XPATH, "./td[1]")
+                if title_cells and title_matches_bond(title_cells[0].text.strip(), bond_full_name):
+                    return
+            except Exception:
+                continue
+        if has_empty_result_hint(driver):
+            return
+        time.sleep(0.2)
+    raise TimeoutException("公告搜索后未出现匹配标题或空结果提示")
 
 
 def wait_for_announcement_results(driver, timeout=30):
@@ -438,48 +637,111 @@ def wait_for_announcement_results(driver, timeout=30):
     deadline = time.time() + timeout
     while time.time() < deadline:
         rows = driver.find_elements(By.XPATH, "//tbody/tr")
-        if any(row.is_displayed() for row in rows):
-            return
+        for row in rows:
+            try:
+                if row.is_displayed():
+                    return
+            except Exception:
+                continue
         empty_hints = driver.find_elements(By.XPATH, "//*[contains(text(),'暂无数据') or contains(text(),'无数据')]")
-        if any(element.is_displayed() for element in empty_hints):
-            return
+        for element in empty_hints:
+            try:
+                if element.is_displayed():
+                    return
+            except Exception:
+                continue
         time.sleep(0.2)
     raise TimeoutException("公告搜索后未出现结果行或空结果提示")
 
 
 def close_download_dialog(driver):
-    _, TimeoutException, _, By, EC, WebDriverWait = _import_selenium()
+    _, TimeoutException, _, By, _, _ = _import_selenium()
     try:
-        button = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, "//*[@role='dialog' and not(contains(@style,'display: none'))]//button[.//*[text()='确定']]"))
+        click_when_ready(
+            driver,
+            By.XPATH,
+            "//*[@role='dialog' and not(contains(@style,'display: none'))]//button[.//*[text()='确定']]",
         )
-        driver.execute_script("arguments[0].click();", button)
     except TimeoutException:
         pass
 
 
 def find_and_download(driver, bond_full_name):
     _, _, _, By, _, _ = _import_selenium()
-    rows = driver.find_elements(By.XPATH, "//tbody/tr")
-    for row in rows:
-        if not row.is_displayed():
-            continue
-        title_cells = row.find_elements(By.XPATH, "./td[1]")
-        if not title_cells:
-            continue
-        title_text = title_cells[0].text.strip()
-        if is_target_prospectus_title(title_text, bond_full_name):
-            download_elements = row.find_elements(By.XPATH, ".//span[contains(@class,'file-desc') and contains(.,'下载')]")
-            if not download_elements:
-                return False, f"找到公告但无附件下载：{title_text}"
-            before_files = snapshot_download_files(driver)
-            driver.execute_script("arguments[0].click();", download_elements[0])
-            close_download_dialog(driver)
-            downloaded = wait_for_download_complete(driver, before_files)
-            if not downloaded:
-                return False, f"下载未在限定时间内完成：{title_text}"
-            return True, title_text
+    print(f"[DEBUG] 开始查找募集说明书: {bond_full_name}")
+
+    for attempt in range(3):
+        print(f"[DEBUG] 第 {attempt + 1} 次尝试查找...")
+        rows = visible_table_rows(driver)
+        print(f"[DEBUG] 当前可见行数: {len(rows)}")
+
+        for i, row in enumerate(rows):
+            try:
+                title_cells = row.find_elements(By.XPATH, "./td[1]")
+                if not title_cells:
+                    continue
+                title_text = title_cells[0].text.strip()
+                print(f"[DEBUG] 第 {i+1} 行标题: {title_text[:50]}...")
+
+                if is_target_prospectus_title(title_text, bond_full_name):
+                    print(f"[DEBUG] 找到匹配标题，准备下载...")
+                    return click_row_download(driver, row, title_text)
+            except Exception as e:
+                print(f"[DEBUG] 处理第 {i+1} 行时出错: {e}")
+                continue
+
+        if rows:
+            try:
+                title_cells = rows[0].find_elements(By.XPATH, "./td[1]")
+                title_text = title_cells[0].text.strip() if title_cells else "第一条搜索结果"
+                print(f"[DEBUG] 未找到匹配标题，尝试下载第一行: {title_text[:50]}...")
+                return click_row_download(driver, rows[0], title_text)
+            except Exception as e:
+                print(f"[DEBUG] 尝试第一行下载失败: {e}")
+        time.sleep(0.3)
+
     return False, "未找到标题匹配的募集说明书公告"
+
+
+def click_row_download(driver, row, title_text):
+    """点击行内的下载按钮，找不到直接报错"""
+    _, _, _, By, _, _ = _import_selenium()
+    # 使用最可靠的XPath：最后一列任何包含"下载"的元素
+    xpath = ".//td[last()]//*[contains(text(),'下载')]"
+    print(f"[DEBUG] 使用XPath查找下载按钮: {xpath}")
+    download_elements = row.find_elements(By.XPATH, xpath)
+    print(f"[DEBUG] 找到 {len(download_elements)} 个下载按钮元素")
+
+    if not download_elements:
+        # 打印所有td的class帮助调试
+        try:
+            tds = row.find_elements(By.XPATH, "./td")
+            print(f"[DEBUG] 行内共有 {len(tds)} 列")
+            for i, td in enumerate(tds):
+                class_attr = td.get_attribute('class')
+                print(f"[DEBUG] 第{i+1}列 class: {class_attr}")
+                text = td.text[:100] if td.text else "空"
+                print(f"[DEBUG] 第{i+1}列内容: {text}")
+        except Exception as e:
+            print(f"[DEBUG] 无法获取列信息: {e}")
+        raise RuntimeError(f"未找到下载按钮：{title_text}")
+
+    print(f"[DEBUG] 准备点击下载按钮...")
+    before_files = snapshot_download_files(driver)
+    print(f"[DEBUG] 下载前文件列表: {before_files}")
+
+    click_element_when_ready(driver, download_elements[0])
+    print(f"[DEBUG] 已点击下载按钮，等待下载完成...")
+
+    close_download_dialog(driver)
+    downloaded = wait_for_download_complete(driver, before_files)
+
+    if downloaded:
+        print(f"[DEBUG] 下载成功: {downloaded}")
+        return True, title_text
+    else:
+        print(f"[DEBUG] 下载超时，未检测到新文件")
+        return False, f"下载未在限定时间内完成：{title_text}"
 
 
 def snapshot_download_files(driver):
@@ -490,36 +752,26 @@ def snapshot_download_files(driver):
 
 def wait_for_download_complete(driver, before_files, timeout=120):
     download_dir = Path(getattr(driver, "download_dir", DEFAULT_DOWNLOAD_DIR))
+    print(f"[DEBUG] 等待下载完成，目录: {download_dir}, 超时: {timeout}s")
     deadline = time.time() + timeout
+    check_count = 0
     while time.time() < deadline:
+        check_count += 1
         files = [path for path in download_dir.iterdir() if path.is_file()]
         new_files = [path for path in files if path.name not in before_files]
         partial_files = [path for path in new_files if path.name.endswith(".crdownload")]
         complete_pdfs = [path for path in new_files if path.suffix.lower() == ".pdf"]
+
+        if check_count % 10 == 0:  # 每5秒打印一次
+            print(f"[DEBUG] 检查 #{check_count}: 新文件 {len(new_files)}, 部分下载 {len(partial_files)}, 完成PDF {len(complete_pdfs)}")
+
         if complete_pdfs and not partial_files:
+            print(f"[DEBUG] 下载完成: {complete_pdfs[0].name}")
             return complete_pdfs[0]
         time.sleep(0.5)
+
+    print(f"[DEBUG] 下载超时，未检测到完成文件")
     return None
-
-
-def close_active_issuer_tab(driver):
-    _, _, _, By, _, _ = _import_selenium()
-    icons = driver.find_elements(By.XPATH, "//li[contains(@class,'tags-li') and contains(@class,'active')]//span[contains(@class,'tags-li-icon')]")
-    if icons:
-        driver.execute_script("arguments[0].click();", icons[0])
-        time.sleep(1)
-
-
-def switch_to_rating_tab(driver):
-    _, _, _, By, _, _ = _import_selenium()
-    tab = find_visible(
-        driver,
-        By.XPATH,
-        "//li[contains(@class,'tags-li') and .//*[text()='主体评级']]",
-        timeout=20,
-    )
-    driver.execute_script("arguments[0].click();", tab)
-    visible_input(driver, "代码、简称、发行人", timeout=20)
 
 
 def write_log(log_path, lines):
@@ -530,34 +782,48 @@ def write_log(log_path, lines):
 def process_rows(driver, rows):
     log_lines = []
     valid_rows = []
+    print(f"[DEBUG] 开始处理 {len(rows)} 行数据")
+
     for row in rows:
         try:
             extract_year_from_bond_full_name(row["bond_full_name"])
+            valid_rows.append(row)
         except ValueError as exc:
+            print(f"[DEBUG] 跳过行(无年份): {row.get('company_name')} - {exc}")
             log_lines.append(
                 f"{row['company_name']}\t{row['bond_short_name']}\t{row['bond_full_name']}\t{exc}"
             )
-            continue
-        valid_rows.append(row)
 
-    for group in group_consecutive_issuers(valid_rows):
-        company_name = group[0]["company_name"]
-        switch_to_rating_tab(driver)
-        search_issuer(driver, company_name)
-        open_announcements_tab(driver)
-        for row in group:
-            bond_full_name = row["bond_full_name"]
+    print(f"[DEBUG] 有效行数: {len(valid_rows)}")
+
+    for idx, row in enumerate(valid_rows):
+        company_name = row["company_name"]
+        bond_full_name = row["bond_full_name"]
+        print(f"\n[DEBUG] === 处理第 {idx+1}/{len(valid_rows)} 只债券 ===")
+        print(f"[DEBUG] 发行人: {company_name}")
+        print(f"[DEBUG] 债券全称: {bond_full_name}")
+
+        try:
             year = extract_year_from_bond_full_name(bond_full_name)
-            search_announcements(driver, year=year, private_only=True)
+            print(f"[DEBUG] 提取年份: {year}")
+
+            search_tenant_announcements(driver, bond_full_name, year)
             ok, message = find_and_download(driver, bond_full_name)
-            if not ok:
-                search_announcements(driver, year=None, private_only=False)
-                ok, message = find_and_download(driver, bond_full_name)
-            if not ok:
+
+            if ok:
+                print(f"[DEBUG] 下载成功: {message}")
+            else:
+                print(f"[DEBUG] 下载失败: {message}")
                 log_lines.append(
                     f"{company_name}\t{row['bond_short_name']}\t{bond_full_name}\t{message}"
                 )
-        close_active_issuer_tab(driver)
+        except Exception as e:
+            print(f"[DEBUG] 处理异常: {e}")
+            log_lines.append(
+                f"{company_name}\t{row['bond_short_name']}\t{bond_full_name}\t{str(e)}"
+            )
+
+    print(f"\n[DEBUG] 全部处理完成，失败记录: {len(log_lines)}")
     return log_lines
 
 
@@ -576,6 +842,10 @@ def main():
             break
     args = parser.parse_args()
 
+    print(f"[DEBUG] 下载目录: {args.download_dir}")
+    print(f"[DEBUG] 输出目录: {args.output_dir}")
+    print(f"[DEBUG] 用户名: {args.username[:3]}****" if args.username else "[DEBUG] 用户名: 未设置")
+
     if not args.username or not args.password:
         raise ValueError("请通过参数或环境变量提供 RATINGDOG_USERNAME/RATINGDOG_PASSWORD")
 
@@ -583,11 +853,17 @@ def main():
     print(f"Excel：{excel_path}")
 
     rows = read_bond_rows(excel_path)
+    print(f"[DEBUG] 从Excel读取 {len(rows)} 行数据")
+
+    print("[DEBUG] 创建Chrome浏览器...")
     driver = create_driver(args.download_dir)
+    print(f"[DEBUG] 浏览器下载目录: {driver.download_dir}")
+
     try:
         login(driver, args.username, args.password)
         log_lines = process_rows(driver, rows)
     finally:
+        print("[DEBUG] 关闭浏览器...")
         driver.quit()
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

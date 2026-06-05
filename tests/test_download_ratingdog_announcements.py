@@ -2,20 +2,29 @@ import unittest
 import os
 import sys
 import tempfile
+import inspect
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "download-private-bond" / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from download_ratingdog_announcements import (
+    build_prospectus_search_keyword,
+    download_button_xpaths,
     extract_year_from_bond_full_name,
     find_latest_prepared_excel,
     group_consecutive_issuers,
     is_target_prospectus_title,
+    first_visible_locator,
+    visible_table_rows,
+    read_pagination_total_count,
     load_skill_env,
+    placeholder_xpath,
+    search_button_xpaths,
     normalize_for_match,
     resolve_excel_path,
     title_matches_bond,
+    search_tenant_announcements,
 )
 
 
@@ -99,6 +108,87 @@ class DownloadRatingdogAnnouncementsTests(unittest.TestCase):
                     os.environ["RATINGDOG_USERNAME"] = old_username
                 if old_password is not None:
                     os.environ["RATINGDOG_PASSWORD"] = old_password
+
+    def test_placeholder_xpath_can_include_type(self):
+        self.assertEqual(
+            placeholder_xpath("请输入密码", input_type="password"),
+            "//input[@placeholder='请输入密码' and @type='password']",
+        )
+
+    def test_build_prospectus_search_keyword(self):
+        self.assertEqual(
+            build_prospectus_search_keyword("某公司2026年非公开发行公司债券"),
+            "某公司2026年非公开发行公司债券募集说明书",
+        )
+
+    def test_search_button_xpath_prefers_input_group_append_button(self):
+        self.assertIn(
+            "yyep-input-group__append",
+            search_button_xpaths()[0],
+        )
+
+    def test_download_button_xpath_prefers_file_desc(self):
+        self.assertIn("file-desc", download_button_xpaths()[0])
+
+    def test_tenant_search_waits_for_result_count_only_after_search_click(self):
+        source = inspect.getsource(search_tenant_announcements)
+
+        self.assertEqual(source.count("wait_for_results_count_below"), 1)
+        self.assertLess(
+            source.index("click_search_button_for_input"),
+            source.index("wait_for_results_count_below"),
+        )
+
+    def test_first_visible_locator_returns_first_visible_candidate(self):
+        class Element:
+            def __init__(self, visible):
+                self.visible = visible
+
+            def is_displayed(self):
+                return self.visible
+
+        class Driver:
+            def find_elements(self, by, locator):
+                return {
+                    "missing": [],
+                    "hidden": [Element(False)],
+                    "visible": [Element(True)],
+                }[locator]
+
+        self.assertIsNot(
+            first_visible_locator(
+                Driver(),
+                [("css", "missing"), ("css", "hidden"), ("css", "visible")],
+            ),
+            False,
+        )
+
+    def test_visible_table_rows_counts_only_displayed_rows(self):
+        class Row:
+            def __init__(self, visible):
+                self.visible = visible
+
+            def is_displayed(self):
+                return self.visible
+
+        class Driver:
+            def find_elements(self, by, locator):
+                return [Row(True), Row(False), Row(True)]
+
+        self.assertEqual(len(visible_table_rows(Driver())), 2)
+
+    def test_read_pagination_total_count_parses_total_text(self):
+        class Total:
+            text = "共 12284 条"
+
+            def is_displayed(self):
+                return True
+
+        class Driver:
+            def find_elements(self, by, locator):
+                return [Total()]
+
+        self.assertEqual(read_pagination_total_count(Driver()), 12284)
 
 
 if __name__ == "__main__":
