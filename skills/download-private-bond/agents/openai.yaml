@@ -1,0 +1,4 @@
+interface:
+  display_name: "私募债募集说明书下载"
+  short_description: "从截图名单生成WIND Excel，并从Ratingdog下载私募债募集说明书。"
+  default_prompt: "根据名单图片准备私募债Excel并下载Ratingdog募集说明书"
