@@ -32,3 +32,9 @@ docs/superpowers/
 
 # Local scratch files
 新建 文本文档.txt
+
+# Claude Code local files
+CLAUDE.md
+
+# Local tests
+tests/
