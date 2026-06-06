@@ -896,27 +896,51 @@ def write_log(log_path, lines):
 
 
 def process_rows(driver, rows):
+    """处理债券列表，返回详细分类日志"""
+    # 分类记录
+    total_bonds = []           # 总名单
+    downloaded_bonds = []      # 完成下载的名单
+    skipped_ppn_bonds = []     # 排除的PPN名单
+    failed_bonds_list = []     # 最后还是没找到的名单
+
     log_lines = []
     valid_rows = []
+
     print(f"[DEBUG] 开始处理 {len(rows)} 行数据")
 
+    # 第一轮筛选：排除PPN债券
     for row in rows:
+        bond_short_name = row.get('bond_short_name', '')
+        total_bonds.append(row)
+
+        # 检查是否为PPN债券
+        if "PPN" in str(bond_short_name).upper():
+            print(f"[DEBUG] 跳过PPN债券: {bond_short_name}")
+            skipped_ppn_bonds.append(row)
+            log_lines.append(
+                f"{row['company_name']}\t{bond_short_name}\t{row.get('bond_full_name', '')}\t[PPN]已排除"
+            )
+            continue
+
+        # 检查年份
         try:
             extract_year_from_bond_full_name(row["bond_full_name"])
             valid_rows.append(row)
         except ValueError as exc:
             print(f"[DEBUG] 跳过行(无年份): {row.get('company_name')} - {exc}")
             log_lines.append(
-                f"{row['company_name']}\t{row['bond_short_name']}\t{row['bond_full_name']}\t{exc}"
+                f"{row['company_name']}\t{bond_short_name}\t{row.get('bond_full_name', '')}\t{exc}"
             )
 
-    print(f"[DEBUG] 有效行数: {len(valid_rows)}")
+    print(f"[DEBUG] 有效行数: {len(valid_rows)} (排除PPN: {len(skipped_ppn_bonds)})")
 
     previous_first_title = ""  # 记录上一只债券的第一行标题
 
     for idx, row in enumerate(valid_rows):
         company_name = row["company_name"]
+        bond_short_name = row["bond_short_name"]
         bond_full_name = row["bond_full_name"]
+
         print(f"\n[DEBUG] === 处理第 {idx+1}/{len(valid_rows)} 只债券 ===")
         print(f"[DEBUG] 发行人: {company_name}")
         print(f"[DEBUG] 债券全称: {bond_full_name}")
@@ -925,14 +949,14 @@ def process_rows(driver, rows):
             year = extract_year_from_bond_full_name(bond_full_name)
             print(f"[DEBUG] 提取年份: {year}")
 
-            rows = search_tenant_announcements(driver, bond_full_name, year, is_first=(idx==0), previous_first_title=previous_first_title)
-            ok, message = find_and_download(driver, bond_full_name, rows)
+            rows_result = search_tenant_announcements(driver, bond_full_name, year, is_first=(idx==0), previous_first_title=previous_first_title)
+            ok, message = find_and_download(driver, bond_full_name, rows_result)
 
             # 记录本次的第一行标题，用于下一次比较
-            if rows:
+            if rows_result:
                 try:
                     from selenium.webdriver.common.by import By
-                    title_cells = rows[0].find_elements(By.XPATH, "./td[1]")
+                    title_cells = rows_result[0].find_elements(By.XPATH, "./td[1]")
                     if title_cells:
                         previous_first_title = title_cells[0].text.strip()
                         print(f"[DEBUG] 记录第一行标题供下次比较: {previous_first_title[:50]}...")
@@ -941,30 +965,63 @@ def process_rows(driver, rows):
 
             if ok:
                 print(f"[DEBUG] 下载成功: {message}")
+                downloaded_bonds.append(row)
             else:
                 print(f"[DEBUG] 下载失败: {message}")
+                failed_bonds_list.append(row)
                 log_lines.append(
-                    f"{company_name}\t{row['bond_short_name']}\t{bond_full_name}\t{message}"
+                    f"{company_name}\t{bond_short_name}\t{bond_full_name}\t{message}"
                 )
         except Exception as e:
             print(f"[DEBUG] 处理异常: {e}")
+            failed_bonds_list.append(row)
             log_lines.append(
-                f"{company_name}\t{row['bond_short_name']}\t{bond_full_name}\t{str(e)}"
+                f"{company_name}\t{bond_short_name}\t{bond_full_name}\t{str(e)}"
             )
 
-    print(f"\n[DEBUG] 全部处理完成，失败记录: {len(log_lines)}")
-    # 返回日志行和失败的债券记录（用于第二轮搜索）
-    failed_bonds = []
-    for line in log_lines:
-        parts = line.split('\t')
-        if len(parts) >= 3:
-            failed_bonds.append({
-                'company_name': parts[0],
-                'bond_short_name': parts[1],
-                'bond_full_name': parts[2],
-                'error': parts[3] if len(parts) > 3 else '未知错误'
-            })
-    return log_lines, failed_bonds
+    # 生成汇总日志
+    summary_lines = [
+        "=" * 80,
+        "下载完成汇总",
+        "=" * 80,
+        f"总债券数: {len(total_bonds)}",
+        f"完成下载: {len(downloaded_bonds)}",
+        f"排除PPN: {len(skipped_ppn_bonds)}",
+        f"下载失败: {len(failed_bonds_list)}",
+        "",
+        "【总名单】",
+    ]
+
+    for row in total_bonds:
+        summary_lines.append(f"  - {row['bond_short_name']}: {row['company_name']}")
+
+    if downloaded_bonds:
+        summary_lines.extend(["", "【完成下载的名单】"])
+        for row in downloaded_bonds:
+            summary_lines.append(f"  ✓ {row['bond_short_name']}: {row['company_name']}")
+
+    if skipped_ppn_bonds:
+        summary_lines.extend(["", "【排除的PPN名单】"])
+        for row in skipped_ppn_bonds:
+            summary_lines.append(f"  ⊘ {row['bond_short_name']}: {row['company_name']} (PPN债券无法下载)")
+
+    if failed_bonds_list:
+        summary_lines.extend(["", "【下载失败的名单】"])
+        for row in failed_bonds_list:
+            summary_lines.append(f"  ✗ {row['bond_short_name']}: {row['company_name']}")
+
+    summary_lines.extend(["", "=" * 80, ""])
+
+    # 合并汇总和详细日志
+    full_log = summary_lines + log_lines
+
+    print(f"\n[DEBUG] 全部处理完成")
+    print(f"[DEBUG]   总债券: {len(total_bonds)}")
+    print(f"[DEBUG]   成功下载: {len(downloaded_bonds)}")
+    print(f"[DEBUG]   排除PPN: {len(skipped_ppn_bonds)}")
+    print(f"[DEBUG]   失败: {len(failed_bonds_list)}")
+
+    return full_log, failed_bonds_list
 
 
 def main():
