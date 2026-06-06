@@ -1,12 +1,14 @@
 import argparse
 import json
 import locale
+import re
 import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
 
 try:
@@ -45,44 +47,31 @@ _set_chinese_collation()
 
 
 def normalize_name(value):
+    if value is None:
+        return ""
     return str(value).strip().replace("（", "(").replace("）", ")")
 
 
-def extract_company_from_bond_full_name(bond_full_name):
-    """从债券全称中提取发行人名称
-
-    债券全称格式：发行人名称2026年面向...
-    提取逻辑：从头开始，找到第一个年份数字（20xx年）为止
-    """
-    if not bond_full_name:
+def extract_company_from_bond_full_name(value):
+    if not value:
         return ""
-
-    import re
-    match = re.search(r'(20\d{2}年)', str(bond_full_name))
-    if match:
-        company = str(bond_full_name)[:match.start()].strip()
-        return company
-    return ""
+    match = re.search(r"20\d{2}年", str(value))
+    if not match:
+        return ""
+    return normalize_name(str(value)[:match.start()])
 
 
 def load_ocr_records(path):
-    """加载OCR识别结果
-
-    支持两种模式：
-    1. 完整模式：company_name + bond_short_name
-    2. 简写模式：仅 bond_short_name（公司名称通过WIND公式自动填充）
-    """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     records = []
     for index, item in enumerate(data, start=1):
         company_name = normalize_name(item.get("company_name", ""))
         bond_short_name = str(item.get("bond_short_name", "")).strip()
-        # 只要求债券简称必须存在，公司名称可以为空（由WIND公式自动填充）
         if not bond_short_name:
             raise ValueError(f"OCR记录第{index}行缺少债券简称")
         records.append(
             {
-                "company_name": company_name,  # 可能为空，由WIND公式自动填充
+                "company_name": company_name,
                 "bond_short_name": bond_short_name,
             }
         )
@@ -97,8 +86,7 @@ def remove_public_and_sort_rows(rows):
     return sorted(
         private_rows,
         key=lambda row: (
-            # 如果公司名称为空，使用债券简称排序
-            locale.strxfrm(normalize_name(row.get("company_name", row.get("bond_short_name", "")))),
+            locale.strxfrm(normalize_name(row.get("company_name", ""))),
             str(row.get("bond_short_name", "")).strip(),
         ),
     )
@@ -111,10 +99,31 @@ def build_output_path(output_dir):
     return output_dir / f"信评需求私募债_{stamp}.xlsx"
 
 
-def _translate_template_formula(formula, row_index):
+def build_rows_json_path(excel_path):
+    return Path(excel_path).with_suffix(".json")
+
+
+def write_rows_json(json_path, rows):
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return json_path
+
+
+def _translate_template_formula(formula, row_index, column=None):
     if not isinstance(formula, str) or not formula.startswith("="):
         return formula
-    return formula.replace("B2", f"B{row_index}").replace("C2", f"C{row_index}")
+    if column is None:
+        return formula
+    origin = f"{get_column_letter(column)}2"
+    target = f"{get_column_letter(column)}{row_index}"
+    try:
+        return Translator(formula, origin=origin).translate_formula(target)
+    except Exception:
+        return formula
 
 
 def fill_template(template_path, output_path, records):
@@ -127,16 +136,13 @@ def fill_template(template_path, output_path, records):
 
     formula_templates = {
         column: sheet.cell(row=2, column=column).value
-        for column in range(3, 6)
+        for column in range(2, 6)
     }
 
     for row_index, record in enumerate(records, start=2):
-        # 如果公司名称不为空，则填入；为空则保留WIND公式自动填充
-        if record["company_name"]:
-            sheet.cell(row=row_index, column=1).value = record["company_name"]
-        sheet.cell(row=row_index, column=2).value = record["bond_short_name"]
+        sheet.cell(row=row_index, column=1).value = record["bond_short_name"]
         for column, formula in formula_templates.items():
-            sheet.cell(row=row_index, column=column).value = _translate_template_formula(formula, row_index)
+            sheet.cell(row=row_index, column=column).value = _translate_template_formula(formula, row_index, column)
 
     if sheet.max_row > len(records) + 1:
         for row_index in range(len(records) + 2, sheet.max_row + 1):
@@ -156,7 +162,7 @@ def fill_template_with_excel(output_path, records):
         sheet = workbook.Worksheets(1)
         formula_templates = {
             column: sheet.Cells(2, column).Formula
-            for column in range(3, 6)
+            for column in range(2, 6)
         }
         used_rows = sheet.UsedRange.Rows.Count
         if used_rows >= 2:
@@ -164,13 +170,10 @@ def fill_template_with_excel(output_path, records):
 
         for offset, record in enumerate(records):
             row_index = offset + 2
-            # 如果公司名称不为空，则填入；为空则保留WIND公式自动填充
-            if record["company_name"]:
-                sheet.Cells(row_index, 1).Value = record["company_name"]
-            sheet.Cells(row_index, 2).Value = record["bond_short_name"]
+            sheet.Cells(row_index, 1).Value = record["bond_short_name"]
             for column, formula in formula_templates.items():
                 if isinstance(formula, str) and formula.startswith("="):
-                    sheet.Cells(row_index, column).Formula = _translate_template_formula(formula, row_index)
+                    sheet.Cells(row_index, column).Formula = _translate_template_formula(formula, row_index, column)
 
         workbook.Save()
     finally:
@@ -193,6 +196,24 @@ def _flatten_excel_range(values):
     return flat_values
 
 
+def is_wind_value_ready(value):
+    if value in (None, "", "Fetching..."):
+        return False
+    if isinstance(value, (int, float)) and str(int(value)).startswith("-214682"):
+        return False
+    if isinstance(value, str) and value.strip().startswith("-214682"):
+        return False
+    return True
+
+
+def rows_have_ready_wind_values(rows):
+    required_keys = ("company_name", "bond_code", "bond_full_name", "issue_method")
+    return bool(rows) and all(
+        all(is_wind_value_ready(row.get(key)) for key in required_keys)
+        for row in rows
+    )
+
+
 def refresh_wind_values(excel_path, max_wait=120):
     if win32com is None:
         raise RuntimeError("未安装 pywin32，无法通过 Excel COM 刷新 WIND 公式")
@@ -208,15 +229,15 @@ def refresh_wind_values(excel_path, max_wait=120):
         deadline = time.time() + max_wait
 
         while time.time() < deadline:
-            values = sheet.Range(f"C2:E{last_row}").Value
+            values = sheet.Range(f"B2:E{last_row}").Value
             flat_values = _flatten_excel_range(values)
-            if flat_values and all(value not in (None, "", "Fetching...") for value in flat_values):
+            if flat_values and all(is_wind_value_ready(value) for value in flat_values):
                 break
             time.sleep(2)
         else:
             raise TimeoutError("等待 WIND 公式计算超时")
 
-        value_range = sheet.Range(f"C2:E{last_row}")
+        value_range = sheet.Range(f"B2:E{last_row}")
         value_range.Value = value_range.Value
         workbook.Save()
     finally:
@@ -225,21 +246,21 @@ def refresh_wind_values(excel_path, max_wait=120):
 
 
 def read_value_rows(excel_path):
-    workbook = load_workbook(excel_path, data_only=False)
+    workbook = load_workbook(excel_path, data_only=True)
     sheet = workbook.active
     rows = []
     for row_index in range(2, sheet.max_row + 1):
-        company_name = sheet.cell(row=row_index, column=1).value
-        bond_short_name = sheet.cell(row=row_index, column=2).value
-        # 只要求债券简称存在，公司名称可以为空（由WIND公式自动填充）
-        if not bond_short_name:
+        bond_short_name = sheet.cell(row=row_index, column=1).value
+        company_name = sheet.cell(row=row_index, column=2).value
+        bond_full_name = sheet.cell(row=row_index, column=4).value
+        if not bond_short_name or not bond_full_name:
             continue
         rows.append(
             {
-                "company_name": normalize_name(company_name) if company_name else "",
+                "company_name": normalize_name(company_name),
                 "bond_short_name": str(bond_short_name).strip(),
                 "bond_code": sheet.cell(row=row_index, column=3).value,
-                "bond_full_name": sheet.cell(row=row_index, column=4).value,
+                "bond_full_name": bond_full_name,
                 "issue_method": sheet.cell(row=row_index, column=5).value,
             }
         )
@@ -254,8 +275,8 @@ def write_final_rows(excel_path, rows):
     if sheet.max_row >= 2:
         sheet.delete_rows(2, sheet.max_row - 1)
     for row_index, row in enumerate(rows, start=2):
-        sheet.cell(row=row_index, column=1).value = row["company_name"]
-        sheet.cell(row=row_index, column=2).value = row["bond_short_name"]
+        sheet.cell(row=row_index, column=1).value = row["bond_short_name"]
+        sheet.cell(row=row_index, column=2).value = row["company_name"]
         sheet.cell(row=row_index, column=3).value = row["bond_code"]
         sheet.cell(row=row_index, column=4).value = row["bond_full_name"]
         sheet.cell(row=row_index, column=5).value = row["issue_method"]
@@ -275,10 +296,23 @@ def main():
     records = load_ocr_records(args.input)
     output_path = build_output_path(args.output_dir)
     fill_template(args.template, output_path, records)
+    refresh_error = None
     if not args.skip_wind:
-        refresh_wind_values(output_path)
-    final_rows = remove_public_and_sort_rows(read_value_rows(output_path))
+        try:
+            refresh_wind_values(output_path)
+        except Exception as exc:
+            refresh_error = exc
+    value_rows = read_value_rows(output_path)
+    if not rows_have_ready_wind_values(value_rows):
+        if refresh_error:
+            raise refresh_error
+        raise RuntimeError("未读取到完整的 WIND 刷新结果，未写入最终 Excel")
+    if refresh_error:
+        print(f"警告：Excel COM 刷新过程报错，但已读取到缓存值并继续处理：{refresh_error}")
+    json_path = write_rows_json(build_rows_json_path(output_path), value_rows)
+    final_rows = remove_public_and_sort_rows(value_rows)
     write_final_rows(output_path, final_rows)
+    print(f"JSON：{json_path}")
     print(f"完成：{output_path}")
 
 

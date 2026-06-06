@@ -1,11 +1,10 @@
 import argparse
+import json
 import os
 import re
 import time
 from datetime import datetime
 from pathlib import Path
-
-from openpyxl import load_workbook
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -22,7 +21,7 @@ def find_project_root(start_path):
 ROOT = find_project_root(SCRIPT_DIR)
 DEFAULT_DOWNLOAD_DIR = ROOT / "Download"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
-DEFAULT_EXCEL_PATTERN = "信评需求私募债_*.xlsx"
+DEFAULT_JSON_PATTERN = "信评需求私募债_*.json"
 DEFAULT_WAIT_SECONDS = 30
 INTERACTION_PAUSE_SECONDS = 0.5
 TENANT_ANNOUNCEMENTS_URL = "https://www.ratingdog.cn/information/announcementsForTenant"
@@ -275,22 +274,23 @@ def group_consecutive_issuers(rows):
     return groups
 
 
-def read_bond_rows(excel_path):
-    workbook = load_workbook(excel_path, data_only=True)
-    sheet = workbook.active
+def read_bond_rows(json_path):
+    data = json.loads(Path(json_path).read_text(encoding="utf-8"))
     rows = []
-    for row_index in range(2, sheet.max_row + 1):
-        company_name = sheet.cell(row=row_index, column=1).value
-        bond_short_name = sheet.cell(row=row_index, column=2).value
-        bond_code = sheet.cell(row=row_index, column=3).value
-        bond_full_name = sheet.cell(row=row_index, column=4).value
-        issue_method = sheet.cell(row=row_index, column=5).value
-        if not company_name or not bond_full_name:
+    for item in data:
+        bond_short_name = item.get("bond_short_name")
+        company_name = item.get("company_name")
+        bond_code = item.get("bond_code")
+        bond_full_name = item.get("bond_full_name")
+        issue_method = item.get("issue_method")
+        if not bond_short_name or not bond_full_name:
+            continue
+        if str(issue_method or "").strip() == "公募":
             continue
         rows.append(
             {
-                "company_name": str(company_name).strip().replace("（", "(").replace("）", ")"),
-                "bond_short_name": str(bond_short_name or "").strip(),
+                "company_name": str(company_name or "").strip().replace("（", "(").replace("）", ")"),
+                "bond_short_name": str(bond_short_name).strip(),
                 "bond_code": str(bond_code or "").strip(),
                 "bond_full_name": str(bond_full_name).strip(),
                 "issue_method": str(issue_method or "").strip(),
@@ -299,23 +299,25 @@ def read_bond_rows(excel_path):
     return rows
 
 
-def find_latest_prepared_excel(output_dir=DEFAULT_OUTPUT_DIR):
+def find_latest_prepared_json(output_dir=DEFAULT_OUTPUT_DIR):
     output_dir = Path(output_dir)
     candidates = [
-        path for path in output_dir.glob(DEFAULT_EXCEL_PATTERN)
+        path for path in output_dir.glob(DEFAULT_JSON_PATTERN)
         if path.is_file()
     ]
     if not candidates:
         raise FileNotFoundError(
-            f"未在 {output_dir} 找到 {DEFAULT_EXCEL_PATTERN}，请先运行 prepare_bond_excel.py 或手动传入 --excel"
+            f"未在 {output_dir} 找到 {DEFAULT_JSON_PATTERN}，请先运行 prepare_bond_excel.py 或手动传入 --json"
         )
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def resolve_excel_path(excel_path, output_dir=DEFAULT_OUTPUT_DIR):
+def resolve_json_path(json_path=None, excel_path=None, output_dir=DEFAULT_OUTPUT_DIR):
+    if json_path:
+        return Path(json_path)
     if excel_path:
-        return Path(excel_path)
-    return find_latest_prepared_excel(output_dir)
+        return Path(excel_path).with_suffix(".json")
+    return find_latest_prepared_json(output_dir)
 
 
 def create_driver(download_dir):
@@ -895,8 +897,14 @@ def write_log(log_path, lines):
     Path(log_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def process_rows(driver, rows):
-    """处理债券列表，返回详细分类日志"""
+def process_rows(driver, rows, is_round2=False):
+    """处理债券列表，返回详细分类日志
+
+    Args:
+        is_round2: 是否为第二轮搜索，会在日志标题中标注
+    """
+    round_label = "【第二轮】" if is_round2 else ""
+
     # 分类记录
     total_bonds = []           # 总名单
     downloaded_bonds = []      # 完成下载的名单
@@ -906,7 +914,7 @@ def process_rows(driver, rows):
     log_lines = []
     valid_rows = []
 
-    print(f"[DEBUG] 开始处理 {len(rows)} 行数据")
+    print(f"[DEBUG] {round_label}开始处理 {len(rows)} 行数据")
 
     # 第一轮筛选：排除PPN债券
     for row in rows:
@@ -982,31 +990,31 @@ def process_rows(driver, rows):
     # 生成汇总日志
     summary_lines = [
         "=" * 80,
-        "下载完成汇总",
+        f"{round_label}下载完成汇总",
         "=" * 80,
-        f"总债券数: {len(total_bonds)}",
-        f"完成下载: {len(downloaded_bonds)}",
-        f"排除PPN: {len(skipped_ppn_bonds)}",
-        f"下载失败: {len(failed_bonds_list)}",
+        f"{round_label}总债券数: {len(total_bonds)}",
+        f"{round_label}完成下载: {len(downloaded_bonds)}",
+        f"{round_label}排除PPN: {len(skipped_ppn_bonds)}",
+        f"{round_label}下载失败: {len(failed_bonds_list)}",
         "",
-        "【总名单】",
+        f"{round_label}【总名单】",
     ]
 
     for row in total_bonds:
         summary_lines.append(f"  - {row['bond_short_name']}: {row['company_name']}")
 
     if downloaded_bonds:
-        summary_lines.extend(["", "【完成下载的名单】"])
+        summary_lines.extend(["", f"{round_label}【完成下载的名单】"])
         for row in downloaded_bonds:
             summary_lines.append(f"  ✓ {row['bond_short_name']}: {row['company_name']}")
 
     if skipped_ppn_bonds:
-        summary_lines.extend(["", "【排除的PPN名单】"])
+        summary_lines.extend(["", f"{round_label}【排除的PPN名单】"])
         for row in skipped_ppn_bonds:
             summary_lines.append(f"  ⊘ {row['bond_short_name']}: {row['company_name']} (PPN债券无法下载)")
 
     if failed_bonds_list:
-        summary_lines.extend(["", "【下载失败的名单】"])
+        summary_lines.extend(["", f"{round_label}【下载失败的名单】"])
         for row in failed_bonds_list:
             summary_lines.append(f"  ✗ {row['bond_short_name']}: {row['company_name']}")
 
@@ -1027,30 +1035,30 @@ def process_rows(driver, rows):
 def main():
     load_skill_env()
     parser = argparse.ArgumentParser(description="从 Ratingdog 下载私募债相关公告附件")
-    parser.add_argument("--excel", required=True, help="prepare_bond_excel.py 输出的 Excel")
+    parser.add_argument("--json", default="", help="prepare_bond_excel.py 输出的 WIND 结果 JSON")
+    parser.add_argument("--excel", default="", help="兼容旧参数：传入 xlsx 时自动改用同名 JSON")
     parser.add_argument("--download-dir", default=str(DEFAULT_DOWNLOAD_DIR), help="PDF 下载目录")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="日志输出目录")
     parser.add_argument("--username", default=os.environ.get("RATINGDOG_USERNAME", ""), help="Ratingdog 手机号")
     parser.add_argument("--password", default=os.environ.get("RATINGDOG_PASSWORD", ""), help="Ratingdog 密码")
-    for action in parser._actions:
-        if action.dest == "excel":
-            action.required = False
-            action.help = "prepare_bond_excel.py 输出的 Excel；未提供时自动使用 output 目录下最新的 信评需求私募债_*.xlsx"
-            break
+    parser.add_argument("--round2", action="store_true", help="标记为第二轮搜索，生成汇总日志")
     args = parser.parse_args()
+
+    is_round2 = args.round2 or any("重试" in str(path) for path in (args.json, args.excel) if path)
 
     print(f"[DEBUG] 下载目录: {args.download_dir}")
     print(f"[DEBUG] 输出目录: {args.output_dir}")
     print(f"[DEBUG] 用户名: {args.username[:3]}****" if args.username else "[DEBUG] 用户名: 未设置")
+    print(f"[DEBUG] 搜索轮次: {'第二轮' if is_round2 else '第一轮'}")
 
     if not args.username or not args.password:
         raise ValueError("请通过参数或环境变量提供 RATINGDOG_USERNAME/RATINGDOG_PASSWORD")
 
-    excel_path = resolve_excel_path(args.excel, args.output_dir)
-    print(f"Excel：{excel_path}")
+    json_path = resolve_json_path(args.json, args.excel, args.output_dir)
+    print(f"JSON：{json_path}")
 
-    rows = read_bond_rows(excel_path)
-    print(f"[DEBUG] 从Excel读取 {len(rows)} 行数据")
+    rows = read_bond_rows(json_path)
+    print(f"[DEBUG] 从JSON读取 {len(rows)} 行数据")
 
     print("[DEBUG] 创建Chrome浏览器...")
     driver = create_driver(args.download_dir)
@@ -1058,7 +1066,7 @@ def main():
 
     try:
         login(driver, args.username, args.password)
-        log_lines, failed_bonds = process_rows(driver, rows)
+        log_lines, failed_bonds = process_rows(driver, rows, is_round2=is_round2)
     finally:
         print("[DEBUG] 关闭浏览器...")
         driver.quit()
@@ -1067,6 +1075,82 @@ def main():
     log_path = Path(args.output_dir) / f"download_log_{stamp}.txt"
     write_log(log_path, log_lines or ["全部债券均已处理，未记录失败项"])
     print(f"日志：{log_path}")
+
+    # 如果是第二轮，生成汇总报告
+    if is_round2:
+        generate_round2_summary(args.output_dir, log_path, len(rows), len(failed_bonds))
+
+
+def generate_round2_summary(output_dir, round2_log_path, total_count, failed_count):
+    """生成第二轮搜索的汇总报告"""
+    # 找到第一轮的日志文件（最新的非重试日志）
+    first_round_logs = sorted(
+        [f for f in Path(output_dir).glob("download_log_*.txt") if "重试" not in f.name and f.name != round2_log_path.name],
+        key=lambda f: f.stat().st_mtime,
+        reverse=True
+    )
+
+    if not first_round_logs:
+        print("[DEBUG] 未找到第一轮日志，跳过汇总")
+        return
+
+    first_round_log = first_round_logs[0]
+    print(f"[DEBUG] 找到第一轮日志: {first_round_log.name}")
+
+    # 解析第一轮统计数据
+    first_total = 0
+    first_success = 0
+    first_ppn = 0
+    first_failed = 0
+
+    try:
+        log_content = first_round_log.read_text(encoding="utf-8")
+        for line in log_content.split('\n'):
+            if "总债券数:" in line:
+                first_total = int(line.split(":")[1].strip())
+            elif "完成下载:" in line:
+                first_success = int(line.split(":")[1].strip())
+            elif "排除PPN:" in line:
+                first_ppn = int(line.split(":")[1].strip())
+            elif "下载失败:" in line:
+                first_failed = int(line.split(":")[1].strip())
+    except Exception as e:
+        print(f"[DEBUG] 解析第一轮日志失败: {e}")
+        return
+
+    # 计算第二轮结果
+    round2_success = total_count - failed_count
+
+    # 生成汇总报告
+    summary_lines = [
+        "=" * 80,
+        "两轮搜索汇总报告",
+        "=" * 80,
+        "",
+        f"第一轮 ({first_round_log.stem}):",
+        f"  总债券: {first_total}",
+        f"  完成下载: {first_success}",
+        f"  排除PPN: {first_ppn}",
+        f"  下载失败: {first_failed}",
+        "",
+        f"第二轮 ({Path(round2_log_path).stem}):",
+        f"  重试债券: {total_count}",
+        f"  第二轮成功: {round2_success}",
+        f"  第二轮仍失败: {failed_count}",
+        "",
+        "最终汇总:",
+        f"  总计债券: {first_total}",
+        f"  最终成功: {first_success + round2_success}",
+        f"  最终失败: {failed_count}",
+        f"  排除PPN: {first_ppn}",
+        f"  成功率: {((first_success + round2_success) / first_total * 100):.1f}%",
+        "",
+        "=" * 80,
+    ]
+
+    summary_path = Path(output_dir) / f"下载汇总报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    write_log(summary_path, summary_lines)
+    print(f"[INFO] 汇总报告已生成: {summary_path}")
 
 
 if __name__ == "__main__":

@@ -18,24 +18,31 @@ def find_project_root():
     return current
 
 
-def clean_residual_files(dry_run=False):
-    """清理临时文件（保留Download文件夹和日志）"""
-    root = find_project_root()
-
+def collect_residual_files(root):
+    root = Path(root)
     patterns_to_clean = [
         "data/*.json",
         "data/*.tmp",
         "output/*.xlsx",
+        "output/*.json",
         # 注意：不清理日志文件 (*.txt)，保留 download_log_*.txt 用于排查问题
     ]
 
     files_to_delete = []
     for pattern in patterns_to_clean:
         for file_path in glob.glob(str(root / pattern)):
-            # 保留 .gitkeep 文件
-            if Path(file_path).name == ".gitkeep":
+            path = Path(file_path)
+            if path.name == ".gitkeep":
                 continue
-            files_to_delete.append(file_path)
+            files_to_delete.append(path)
+    return files_to_delete
+
+
+def clean_residual_files(dry_run=False):
+    """清理临时文件（保留Download文件夹和日志）"""
+    root = find_project_root()
+
+    files_to_delete = collect_residual_files(root)
 
     if not files_to_delete:
         print("[INFO] 无临时文件需要清理")
@@ -53,9 +60,9 @@ def clean_residual_files(dry_run=False):
     cleaned_count = 0
     for file_path in files_to_delete:
         try:
-            Path(file_path).unlink()
+            file_path.unlink()
             cleaned_count += 1
-            print(f"[DEBUG] 已删除: {Path(file_path).name}")
+            print(f"[DEBUG] 已删除: {file_path.name}")
         except Exception as e:
             print(f"[WARN] 无法删除 {file_path}: {e}")
 
