@@ -618,11 +618,6 @@ def wait_for_search_results(driver, bond_full_name, previous_first_title="", tim
     print(f"[DEBUG] 等待超时，返回当前 {len(final_rows)} 行")
     return final_rows
 
-    # 超时返回当前可见行
-    final_rows = visible_table_rows(driver)
-    print(f"[DEBUG] 等待超时，返回当前 {len(final_rows)} 行")
-    return final_rows
-
 
 def search_tenant_announcements(driver, bond_full_name, year, is_first=False, previous_first_title=""):
     _, _, _, By, _, _ = _import_selenium()
@@ -1006,7 +1001,7 @@ def main():
 
     try:
         login(driver, args.username, args.password)
-        log_lines = process_rows(driver, rows)
+        log_lines, failed_bonds = process_rows(driver, rows)
     finally:
         print("[DEBUG] 关闭浏览器...")
         driver.quit()

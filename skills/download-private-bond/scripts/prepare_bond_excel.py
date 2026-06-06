@@ -48,17 +48,41 @@ def normalize_name(value):
     return str(value).strip().replace("（", "(").replace("）", ")")
 
 
+def extract_company_from_bond_full_name(bond_full_name):
+    """从债券全称中提取发行人名称
+
+    债券全称格式：发行人名称2026年面向...
+    提取逻辑：从头开始，找到第一个年份数字（20xx年）为止
+    """
+    if not bond_full_name:
+        return ""
+
+    import re
+    match = re.search(r'(20\d{2}年)', str(bond_full_name))
+    if match:
+        company = str(bond_full_name)[:match.start()].strip()
+        return company
+    return ""
+
+
 def load_ocr_records(path):
+    """加载OCR识别结果
+
+    支持两种模式：
+    1. 完整模式：company_name + bond_short_name
+    2. 简写模式：仅 bond_short_name（公司名称通过WIND公式自动填充）
+    """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     records = []
     for index, item in enumerate(data, start=1):
         company_name = normalize_name(item.get("company_name", ""))
         bond_short_name = str(item.get("bond_short_name", "")).strip()
-        if not company_name or not bond_short_name:
-            raise ValueError(f"OCR记录第{index}行缺少公司名称或债券简称")
+        # 只要求债券简称必须存在，公司名称可以为空（由WIND公式自动填充）
+        if not bond_short_name:
+            raise ValueError(f"OCR记录第{index}行缺少债券简称")
         records.append(
             {
-                "company_name": company_name,
+                "company_name": company_name,  # 可能为空，由WIND公式自动填充
                 "bond_short_name": bond_short_name,
             }
         )
@@ -73,7 +97,8 @@ def remove_public_and_sort_rows(rows):
     return sorted(
         private_rows,
         key=lambda row: (
-            locale.strxfrm(normalize_name(row.get("company_name", ""))),
+            # 如果公司名称为空，使用债券简称排序
+            locale.strxfrm(normalize_name(row.get("company_name", row.get("bond_short_name", "")))),
             str(row.get("bond_short_name", "")).strip(),
         ),
     )
@@ -106,7 +131,9 @@ def fill_template(template_path, output_path, records):
     }
 
     for row_index, record in enumerate(records, start=2):
-        sheet.cell(row=row_index, column=1).value = record["company_name"]
+        # 如果公司名称不为空，则填入；为空则保留WIND公式自动填充
+        if record["company_name"]:
+            sheet.cell(row=row_index, column=1).value = record["company_name"]
         sheet.cell(row=row_index, column=2).value = record["bond_short_name"]
         for column, formula in formula_templates.items():
             sheet.cell(row=row_index, column=column).value = _translate_template_formula(formula, row_index)
@@ -137,7 +164,9 @@ def fill_template_with_excel(output_path, records):
 
         for offset, record in enumerate(records):
             row_index = offset + 2
-            sheet.Cells(row_index, 1).Value = record["company_name"]
+            # 如果公司名称不为空，则填入；为空则保留WIND公式自动填充
+            if record["company_name"]:
+                sheet.Cells(row_index, 1).Value = record["company_name"]
             sheet.Cells(row_index, 2).Value = record["bond_short_name"]
             for column, formula in formula_templates.items():
                 if isinstance(formula, str) and formula.startswith("="):
@@ -202,11 +231,12 @@ def read_value_rows(excel_path):
     for row_index in range(2, sheet.max_row + 1):
         company_name = sheet.cell(row=row_index, column=1).value
         bond_short_name = sheet.cell(row=row_index, column=2).value
-        if not company_name or not bond_short_name:
+        # 只要求债券简称存在，公司名称可以为空（由WIND公式自动填充）
+        if not bond_short_name:
             continue
         rows.append(
             {
-                "company_name": normalize_name(company_name),
+                "company_name": normalize_name(company_name) if company_name else "",
                 "bond_short_name": str(bond_short_name).strip(),
                 "bond_code": sheet.cell(row=row_index, column=3).value,
                 "bond_full_name": sheet.cell(row=row_index, column=4).value,
