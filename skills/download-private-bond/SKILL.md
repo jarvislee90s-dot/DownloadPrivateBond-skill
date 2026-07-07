@@ -110,8 +110,9 @@ $env:RATINGDOG_PASSWORD="密码"
 ```
 
 **输出位置：**
-- PDF 下载到 `Download\`
-- 日志写入 `output\download_log_YYYYMMDD_HHMMSS.txt`
+- PDF 下载到**当前工作目录**（agent 调用时的项目目录）下的 `Download\`
+- 日志写入当前工作目录下的 `output\download_log_YYYYMMDD_HHMMSS.txt`
+- 若当前工作目录不存在 `data`/`output`/`Download`，则回退到 skill 自身目录
 
 ### 4. 第二轮搜索（可选）
 

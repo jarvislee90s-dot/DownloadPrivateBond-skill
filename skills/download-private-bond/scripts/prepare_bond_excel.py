@@ -1,320 +1,325 @@
-import argparse
-import json
-import locale
-import re
-import shutil
-import time
-from datetime import datetime
-from pathlib import Path
-
-from openpyxl import load_workbook
-from openpyxl.formula.translate import Translator
-from openpyxl.utils import get_column_letter
-
-try:
-    import win32com.client
-except ImportError:
-    win32com = None
-
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-SKILL_DIR = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
-
-
-def find_project_root(start_path):
-    for path in [start_path, *start_path.parents]:
-        if (path / "data").exists() and (path / "reference").exists():
-            return path
-    return Path.cwd()
-
-
-ROOT = find_project_root(SCRIPT_DIR)
-DEFAULT_INPUT = ROOT / "data" / "bond_list.json"
-DEFAULT_TEMPLATE = SKILL_DIR / "assets" / "公式模板.xlsx"
-DEFAULT_OUTPUT_DIR = ROOT / "output"
-
-
-def _set_chinese_collation():
-    for locale_name in ("Chinese_China.936", "zh_CN.UTF-8", "chs"):
-        try:
-            locale.setlocale(locale.LC_COLLATE, locale_name)
-            return
-        except locale.Error:
-            continue
-
-
-_set_chinese_collation()
-
-
-def normalize_name(value):
-    if value is None:
-        return ""
-    return str(value).strip().replace("（", "(").replace("）", ")")
-
-
-def extract_company_from_bond_full_name(value):
-    if not value:
-        return ""
-    match = re.search(r"20\d{2}年", str(value))
-    if not match:
-        return ""
-    return normalize_name(str(value)[:match.start()])
-
-
-def load_ocr_records(path):
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    records = []
-    for index, item in enumerate(data, start=1):
-        company_name = normalize_name(item.get("company_name", ""))
-        bond_short_name = str(item.get("bond_short_name", "")).strip()
-        if not bond_short_name:
-            raise ValueError(f"OCR记录第{index}行缺少债券简称")
-        records.append(
-            {
-                "company_name": company_name,
-                "bond_short_name": bond_short_name,
-            }
-        )
-    return records
-
-
-def remove_public_and_sort_rows(rows):
-    private_rows = [
-        row for row in rows
-        if str(row.get("issue_method", "")).strip() != "公募"
-    ]
-    return sorted(
-        private_rows,
-        key=lambda row: (
-            locale.strxfrm(normalize_name(row.get("company_name", ""))),
-            str(row.get("bond_short_name", "")).strip(),
-        ),
-    )
-
-
-def build_output_path(output_dir):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_dir / f"信评需求私募债_{stamp}.xlsx"
-
-
-def build_rows_json_path(excel_path):
-    return Path(excel_path).with_suffix(".json")
-
-
-def write_rows_json(json_path, rows):
-    json_path = Path(json_path)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(
-        json.dumps(rows, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return json_path
-
-
-def _translate_template_formula(formula, row_index, column=None):
-    if not isinstance(formula, str) or not formula.startswith("="):
-        return formula
-    if column is None:
-        return formula
-    origin = f"{get_column_letter(column)}2"
-    target = f"{get_column_letter(column)}{row_index}"
-    try:
-        return Translator(formula, origin=origin).translate_formula(target)
-    except Exception:
-        return formula
-
-
-def fill_template(template_path, output_path, records):
-    shutil.copy2(template_path, output_path)
-    if win32com is not None:
-        return fill_template_with_excel(output_path, records)
-
-    workbook = load_workbook(output_path)
-    sheet = workbook.active
-
-    formula_templates = {
-        column: sheet.cell(row=2, column=column).value
-        for column in range(2, 6)
-    }
-
-    for row_index, record in enumerate(records, start=2):
-        sheet.cell(row=row_index, column=1).value = record["bond_short_name"]
-        for column, formula in formula_templates.items():
-            sheet.cell(row=row_index, column=column).value = _translate_template_formula(formula, row_index, column)
-
-    if sheet.max_row > len(records) + 1:
-        for row_index in range(len(records) + 2, sheet.max_row + 1):
-            for column in range(1, 6):
-                sheet.cell(row=row_index, column=column).value = None
-
-    workbook.save(output_path)
-    return output_path
-
-
-def fill_template_with_excel(output_path, records):
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = True
-    excel.DisplayAlerts = False
-    workbook = excel.Workbooks.Open(str(Path(output_path).resolve()), UpdateLinks=0)
-    try:
-        sheet = workbook.Worksheets(1)
-        formula_templates = {
-            column: sheet.Cells(2, column).Formula
-            for column in range(2, 6)
-        }
-        used_rows = sheet.UsedRange.Rows.Count
-        if used_rows >= 2:
-            sheet.Range(f"A2:E{max(used_rows, len(records) + 1)}").ClearContents()
-
-        for offset, record in enumerate(records):
-            row_index = offset + 2
-            sheet.Cells(row_index, 1).Value = record["bond_short_name"]
-            for column, formula in formula_templates.items():
-                if isinstance(formula, str) and formula.startswith("="):
-                    sheet.Cells(row_index, column).Formula = _translate_template_formula(formula, row_index, column)
-
-        workbook.Save()
-    finally:
-        workbook.Close(SaveChanges=True)
-        excel.Quit()
-    return output_path
-
-
-def _flatten_excel_range(values):
-    if values is None:
-        return []
-    if not isinstance(values, tuple):
-        return [values]
-    flat_values = []
-    for row in values:
-        if isinstance(row, tuple):
-            flat_values.extend(row)
-        else:
-            flat_values.append(row)
-    return flat_values
-
-
-def is_wind_value_ready(value):
-    if value in (None, "", "Fetching..."):
-        return False
-    if isinstance(value, (int, float)) and str(int(value)).startswith("-214682"):
-        return False
-    if isinstance(value, str) and value.strip().startswith("-214682"):
-        return False
-    return True
-
-
-def rows_have_ready_wind_values(rows):
-    required_keys = ("company_name", "bond_code", "bond_full_name", "issue_method")
-    return bool(rows) and all(
-        all(is_wind_value_ready(row.get(key)) for key in required_keys)
-        for row in rows
-    )
-
-
-def refresh_wind_values(excel_path, max_wait=120):
-    if win32com is None:
-        raise RuntimeError("未安装 pywin32，无法通过 Excel COM 刷新 WIND 公式")
-
-    excel = win32com.client.Dispatch("Excel.Application")
-    excel.Visible = True
-    excel.DisplayAlerts = False
-    workbook = excel.Workbooks.Open(str(Path(excel_path).resolve()), UpdateLinks=0)
-    try:
-        excel.CalculateFullRebuild()
-        sheet = workbook.Worksheets(1)
-        last_row = sheet.UsedRange.Rows.Count
-        deadline = time.time() + max_wait
-
-        while time.time() < deadline:
-            values = sheet.Range(f"B2:E{last_row}").Value
-            flat_values = _flatten_excel_range(values)
-            if flat_values and all(is_wind_value_ready(value) for value in flat_values):
-                break
-            time.sleep(2)
-        else:
-            raise TimeoutError("等待 WIND 公式计算超时")
-
-        value_range = sheet.Range(f"B2:E{last_row}")
-        value_range.Value = value_range.Value
-        workbook.Save()
-    finally:
-        workbook.Close(SaveChanges=True)
-        excel.Quit()
-
-
-def read_value_rows(excel_path):
-    workbook = load_workbook(excel_path, data_only=True)
-    sheet = workbook.active
-    rows = []
-    for row_index in range(2, sheet.max_row + 1):
-        bond_short_name = sheet.cell(row=row_index, column=1).value
-        company_name = sheet.cell(row=row_index, column=2).value
-        bond_full_name = sheet.cell(row=row_index, column=4).value
-        if not bond_short_name or not bond_full_name:
-            continue
-        rows.append(
-            {
-                "company_name": normalize_name(company_name),
-                "bond_short_name": str(bond_short_name).strip(),
-                "bond_code": sheet.cell(row=row_index, column=3).value,
-                "bond_full_name": bond_full_name,
-                "issue_method": sheet.cell(row=row_index, column=5).value,
-            }
-        )
-    return rows
-
-
-def write_final_rows(excel_path, rows):
-    workbook = load_workbook(excel_path)
-    if hasattr(workbook, "_external_links"):
-        workbook._external_links = []
-    sheet = workbook.active
-    if sheet.max_row >= 2:
-        sheet.delete_rows(2, sheet.max_row - 1)
-    for row_index, row in enumerate(rows, start=2):
-        sheet.cell(row=row_index, column=1).value = row["bond_short_name"]
-        sheet.cell(row=row_index, column=2).value = row["company_name"]
-        sheet.cell(row=row_index, column=3).value = row["bond_code"]
-        sheet.cell(row=row_index, column=4).value = row["bond_full_name"]
-        sheet.cell(row=row_index, column=5).value = row["issue_method"]
-    for column in range(1, 6):
-        sheet.column_dimensions[get_column_letter(column)].width = 24
-    workbook.save(excel_path)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="生成并刷新私募债 WIND 数据 Excel")
-    parser.add_argument("--input", default=str(DEFAULT_INPUT), help="agent OCR 结果 JSON")
-    parser.add_argument("--template", default=str(DEFAULT_TEMPLATE), help="公式模板 xlsx")
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="输出目录")
-    parser.add_argument("--skip-wind", action="store_true", help="跳过 WIND 刷新，仅用于开发测试")
-    args = parser.parse_args()
-
-    records = load_ocr_records(args.input)
-    output_path = build_output_path(args.output_dir)
-    fill_template(args.template, output_path, records)
-    refresh_error = None
-    if not args.skip_wind:
-        try:
-            refresh_wind_values(output_path)
-        except Exception as exc:
-            refresh_error = exc
-    value_rows = read_value_rows(output_path)
-    if not rows_have_ready_wind_values(value_rows):
-        if refresh_error:
-            raise refresh_error
-        raise RuntimeError("未读取到完整的 WIND 刷新结果，未写入最终 Excel")
-    if refresh_error:
-        print(f"警告：Excel COM 刷新过程报错，但已读取到缓存值并继续处理：{refresh_error}")
-    json_path = write_rows_json(build_rows_json_path(output_path), value_rows)
-    final_rows = remove_public_and_sort_rows(value_rows)
-    write_final_rows(output_path, final_rows)
-    print(f"JSON：{json_path}")
-    print(f"完成：{output_path}")
-
-
-if __name__ == "__main__":
-    main()
+import argparse
+import json
+import locale
+import re
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
+
+from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
+from openpyxl.utils import get_column_letter
+
+try:
+    import win32com.client
+except ImportError:
+    win32com = None
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_DIR = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
+
+
+def find_project_root(start_path):
+    # 优先使用当前工作目录（agent 调用时的项目目录）
+    cwd = Path.cwd()
+    if (cwd / "data").exists() or (cwd / "output").exists() or (cwd / "Download").exists():
+        return cwd
+    # 回退到 skill 目录
+    for path in [start_path, *start_path.parents]:
+        if (path / "data").exists() and (path / "reference").exists():
+            return path
+    return cwd
+
+
+ROOT = find_project_root(SCRIPT_DIR)
+DEFAULT_INPUT = ROOT / "data" / "bond_list.json"
+DEFAULT_TEMPLATE = SKILL_DIR / "assets" / "公式模板.xlsx"
+DEFAULT_OUTPUT_DIR = ROOT / "output"
+
+
+def _set_chinese_collation():
+    for locale_name in ("Chinese_China.936", "zh_CN.UTF-8", "chs"):
+        try:
+            locale.setlocale(locale.LC_COLLATE, locale_name)
+            return
+        except locale.Error:
+            continue
+
+
+_set_chinese_collation()
+
+
+def normalize_name(value):
+    if value is None:
+        return ""
+    return str(value).strip().replace("（", "(").replace("）", ")")
+
+
+def extract_company_from_bond_full_name(value):
+    if not value:
+        return ""
+    match = re.search(r"20\d{2}年", str(value))
+    if not match:
+        return ""
+    return normalize_name(str(value)[:match.start()])
+
+
+def load_ocr_records(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    records = []
+    for index, item in enumerate(data, start=1):
+        company_name = normalize_name(item.get("company_name", ""))
+        bond_short_name = str(item.get("bond_short_name", "")).strip()
+        if not bond_short_name:
+            raise ValueError(f"OCR记录第{index}行缺少债券简称")
+        records.append(
+            {
+                "company_name": company_name,
+                "bond_short_name": bond_short_name,
+            }
+        )
+    return records
+
+
+def remove_public_and_sort_rows(rows):
+    private_rows = [
+        row for row in rows
+        if str(row.get("issue_method", "")).strip() != "公募"
+    ]
+    return sorted(
+        private_rows,
+        key=lambda row: (
+            locale.strxfrm(normalize_name(row.get("company_name", ""))),
+            str(row.get("bond_short_name", "")).strip(),
+        ),
+    )
+
+
+def build_output_path(output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return output_dir / f"信评需求私募债_{stamp}.xlsx"
+
+
+def build_rows_json_path(excel_path):
+    return Path(excel_path).with_suffix(".json")
+
+
+def write_rows_json(json_path, rows):
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return json_path
+
+
+def _translate_template_formula(formula, row_index, column=None):
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return formula
+    if column is None:
+        return formula
+    origin = f"{get_column_letter(column)}2"
+    target = f"{get_column_letter(column)}{row_index}"
+    try:
+        return Translator(formula, origin=origin).translate_formula(target)
+    except Exception:
+        return formula
+
+
+def fill_template(template_path, output_path, records):
+    shutil.copy2(template_path, output_path)
+    if win32com is not None:
+        return fill_template_with_excel(output_path, records)
+
+    workbook = load_workbook(output_path)
+    sheet = workbook.active
+
+    formula_templates = {
+        column: sheet.cell(row=2, column=column).value
+        for column in range(2, 6)
+    }
+
+    for row_index, record in enumerate(records, start=2):
+        sheet.cell(row=row_index, column=1).value = record["bond_short_name"]
+        for column, formula in formula_templates.items():
+            sheet.cell(row=row_index, column=column).value = _translate_template_formula(formula, row_index, column)
+
+    if sheet.max_row > len(records) + 1:
+        for row_index in range(len(records) + 2, sheet.max_row + 1):
+            for column in range(1, 6):
+                sheet.cell(row=row_index, column=column).value = None
+
+    workbook.save(output_path)
+    return output_path
+
+
+def fill_template_with_excel(output_path, records):
+    excel = win32com.client.DispatchEx("Excel.Application")
+    excel.Visible = True
+    excel.DisplayAlerts = False
+    workbook = excel.Workbooks.Open(str(Path(output_path).resolve()), UpdateLinks=0)
+    try:
+        sheet = workbook.Worksheets(1)
+        formula_templates = {
+            column: sheet.Cells(2, column).Formula
+            for column in range(2, 6)
+        }
+        used_rows = sheet.UsedRange.Rows.Count
+        if used_rows >= 2:
+            sheet.Range(f"A2:E{max(used_rows, len(records) + 1)}").ClearContents()
+
+        for offset, record in enumerate(records):
+            row_index = offset + 2
+            sheet.Cells(row_index, 1).Value = record["bond_short_name"]
+            for column, formula in formula_templates.items():
+                if isinstance(formula, str) and formula.startswith("="):
+                    sheet.Cells(row_index, column).Formula = _translate_template_formula(formula, row_index, column)
+
+        workbook.Save()
+    finally:
+        workbook.Close(SaveChanges=True)
+        excel.Quit()
+    return output_path
+
+
+def _flatten_excel_range(values):
+    if values is None:
+        return []
+    if not isinstance(values, tuple):
+        return [values]
+    flat_values = []
+    for row in values:
+        if isinstance(row, tuple):
+            flat_values.extend(row)
+        else:
+            flat_values.append(row)
+    return flat_values
+
+
+def is_wind_value_ready(value):
+    if value in (None, "", "Fetching..."):
+        return False
+    if isinstance(value, (int, float)) and str(int(value)).startswith("-214682"):
+        return False
+    if isinstance(value, str) and value.strip().startswith("-214682"):
+        return False
+    return True
+
+
+def rows_have_ready_wind_values(rows):
+    required_keys = ("company_name", "bond_code", "bond_full_name", "issue_method")
+    return bool(rows) and all(
+        all(is_wind_value_ready(row.get(key)) for key in required_keys)
+        for row in rows
+    )
+
+
+def refresh_wind_values(excel_path, max_wait=120):
+    if win32com is None:
+        raise RuntimeError("未安装 pywin32，无法通过 Excel COM 刷新 WIND 公式")
+
+    excel = win32com.client.Dispatch("Excel.Application")
+    excel.Visible = True
+    excel.DisplayAlerts = False
+    workbook = excel.Workbooks.Open(str(Path(excel_path).resolve()), UpdateLinks=0)
+    try:
+        excel.CalculateFullRebuild()
+        sheet = workbook.Worksheets(1)
+        last_row = sheet.UsedRange.Rows.Count
+        deadline = time.time() + max_wait
+
+        while time.time() < deadline:
+            values = sheet.Range(f"B2:E{last_row}").Value
+            flat_values = _flatten_excel_range(values)
+            if flat_values and all(is_wind_value_ready(value) for value in flat_values):
+                break
+            time.sleep(2)
+        else:
+            raise TimeoutError("等待 WIND 公式计算超时")
+
+        value_range = sheet.Range(f"B2:E{last_row}")
+        value_range.Value = value_range.Value
+        workbook.Save()
+    finally:
+        workbook.Close(SaveChanges=True)
+        excel.Quit()
+
+
+def read_value_rows(excel_path):
+    workbook = load_workbook(excel_path, data_only=True)
+    sheet = workbook.active
+    rows = []
+    for row_index in range(2, sheet.max_row + 1):
+        bond_short_name = sheet.cell(row=row_index, column=1).value
+        company_name = sheet.cell(row=row_index, column=2).value
+        bond_full_name = sheet.cell(row=row_index, column=4).value
+        if not bond_short_name or not bond_full_name:
+            continue
+        rows.append(
+            {
+                "company_name": normalize_name(company_name),
+                "bond_short_name": str(bond_short_name).strip(),
+                "bond_code": sheet.cell(row=row_index, column=3).value,
+                "bond_full_name": bond_full_name,
+                "issue_method": sheet.cell(row=row_index, column=5).value,
+            }
+        )
+    return rows
+
+
+def write_final_rows(excel_path, rows):
+    workbook = load_workbook(excel_path)
+    if hasattr(workbook, "_external_links"):
+        workbook._external_links = []
+    sheet = workbook.active
+    if sheet.max_row >= 2:
+        sheet.delete_rows(2, sheet.max_row - 1)
+    for row_index, row in enumerate(rows, start=2):
+        sheet.cell(row=row_index, column=1).value = row["bond_short_name"]
+        sheet.cell(row=row_index, column=2).value = row["company_name"]
+        sheet.cell(row=row_index, column=3).value = row["bond_code"]
+        sheet.cell(row=row_index, column=4).value = row["bond_full_name"]
+        sheet.cell(row=row_index, column=5).value = row["issue_method"]
+    for column in range(1, 6):
+        sheet.column_dimensions[get_column_letter(column)].width = 24
+    workbook.save(excel_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="生成并刷新私募债 WIND 数据 Excel")
+    parser.add_argument("--input", default=str(DEFAULT_INPUT), help="agent OCR 结果 JSON")
+    parser.add_argument("--template", default=str(DEFAULT_TEMPLATE), help="公式模板 xlsx")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="输出目录")
+    parser.add_argument("--skip-wind", action="store_true", help="跳过 WIND 刷新，仅用于开发测试")
+    args = parser.parse_args()
+
+    records = load_ocr_records(args.input)
+    output_path = build_output_path(args.output_dir)
+    fill_template(args.template, output_path, records)
+    refresh_error = None
+    if not args.skip_wind:
+        try:
+            refresh_wind_values(output_path)
+        except Exception as exc:
+            refresh_error = exc
+    value_rows = read_value_rows(output_path)
+    if not rows_have_ready_wind_values(value_rows):
+        if refresh_error:
+            raise refresh_error
+        raise RuntimeError("未读取到完整的 WIND 刷新结果，未写入最终 Excel")
+    if refresh_error:
+        print(f"警告：Excel COM 刷新过程报错，但已读取到缓存值并继续处理：{refresh_error}")
+    json_path = write_rows_json(build_rows_json_path(output_path), value_rows)
+    final_rows = remove_public_and_sort_rows(value_rows)
+    write_final_rows(output_path, final_rows)
+    print(f"JSON：{json_path}")
+    print(f"完成：{output_path}")
+
+
+if __name__ == "__main__":
+    main()
